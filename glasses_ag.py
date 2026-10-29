@@ -14,9 +14,9 @@ What it does:
   * Registers org.bluez.Profile1 endpoints for HFP (111e out, 111f in)
     and holds the service-level connection with the glasses. Sessions
     are per-device objects keyed by Bluetooth address (hfp_registry);
-    the glasses are tenant #1. Any other paired device is routed to
-    a slot that, until the generic personality lands (v2 Step B),
-    refuses service with a logged reason.
+    the glasses are tenant #1. Any other paired device gets a generic
+    spec-driven HFP session (hfp_generic: SLC only; its audio-open is
+    refused with a logged reason until v2 Step C).
   * Dictation (via the `glasses-mic` control command): runs a silent,
     gateway-declared outgoing call (dialing -> alerting -> connected,
     no ring, no gesture), negotiates mSBC, opens SCO, plays a two-blip
@@ -67,6 +67,7 @@ from array import array
 from collections import deque
 from datetime import datetime
 
+import hfp_generic
 import hfp_registry
 
 try:
@@ -1375,8 +1376,8 @@ class Profile(dbus.service.Object):
     def read_device_info(self, device):
         """Pull the fingerprint inputs for `device` from BlueZ. A
         failure degrades to an unknown device (address "?"), which
-        routes to the generic slot and is refused with a logged
-        reason — never an exception out of NewConnection."""
+        is refused at connect with a logged reason (no usable session
+        key) — never an exception out of NewConnection."""
         try:
             props = dbus.Interface(
                 self.bus.get_object(BLUEZ, device),
@@ -1404,9 +1405,9 @@ class Profile(dbus.service.Object):
     def NewConnection(self, device, fd, properties):
         # Admission is BlueZ pairing — no allowlist here. The
         # fingerprint (hfp_registry.PERSONALITY_RULES) only selects
-        # which personality the device's session slot gets: the
-        # glasses personality for a fingerprint match, otherwise the
-        # generic slot (which, until Step B, refuses with a reason).
+        # which personality the device's session gets: the glasses
+        # personality for a fingerprint match, otherwise the generic
+        # one. Only an unidentifiable device is refused at connect.
         info = self.read_device_info(device)
         adm = self.registry.admit(info)
         if adm.refused:
@@ -1414,9 +1415,6 @@ class Profile(dbus.service.Object):
             raise dbus.exceptions.DBusException(
                 f"glasses-ag: {reason}",
                 name="org.bluez.Error.Rejected")
-        # Glasses personality.
-        if info.address != "?":
-            self.core.device_address = info.address
         fd_int = fd.take()
         try:
             sock = socket.fromfd(fd_int, socket.AF_BLUETOOTH,
@@ -1424,6 +1422,18 @@ class Profile(dbus.service.Object):
         finally:
             os.close(fd_int)
         sock.settimeout(None)
+        if adm.personality == hfp_registry.PERSONALITY_GENERIC:
+            gsess = hfp_generic.GenericSession(
+                sock, device, info.address, name=info.display_name,
+                registry=self.registry, log=log)
+            prior = self.registry.attach(info.address, gsess)
+            if prior is not None and getattr(prior, "alive", False):
+                prior.close()       # a reconnect supersedes the old link
+            threading.Thread(target=gsess.run, daemon=True).start()
+            return
+        # Glasses personality (frozen baseline).
+        if info.address != "?":
+            self.core.device_address = info.address
         sess = Session(sock, device, self.core, address=info.address,
                        registry=self.registry)
         self.registry.attach(info.address, sess)
@@ -1549,7 +1559,7 @@ def main():
     threading.Thread(target=control_server, args=(router,),
                      daemon=True).start()
     log("ready — waiting for devices to connect "
-        "(glasses -> glasses personality; others -> generic slot)")
+        "(glasses -> glasses personality; others -> generic personality)")
     loop = GLib.MainLoop()
     try:
         loop.run()

@@ -23,10 +23,10 @@ import time
 PERSONALITY_GLASSES = "glasses"
 PERSONALITY_GENERIC = "generic"
 
-# Step A: generic devices are admitted into a slot, but the slot has
-# no gateway behavior yet. Step B replaces this refusal.
-GENERIC_NOT_IMPLEMENTED = (
-    "generic HFP personality not implemented yet (v2 Step B)")
+# A device whose BlueZ identity could not be read has no usable key
+# (address "?"), so it cannot hold a per-device session.
+UNIDENTIFIED_DEVICE = ("device identity unreadable from BlueZ; cannot "
+                       "key a session for it")
 
 
 def _default_log(msg):
@@ -117,8 +117,10 @@ class DeviceRecord:
         self.personality = personality
         self.session = None
         self.connections = 0
-        self.refusals = 0
+        self.refusals = 0           # connect-time refusals
         self.last_reason = ""
+        self.audio_refusals = 0     # audio-open refusals (generic)
+        self.last_audio_reason = ""
         self.last_event = time.time()
 
     def link(self):
@@ -131,8 +133,10 @@ class DeviceRecord:
 
 
 class RefusedSlot:
-    """The Step A stand-in for the generic personality: a slot that
-    cleanly refuses service, with the reason logged."""
+    """A slot that cleanly refuses service at connect time, with the
+    reason logged. Used for devices that cannot be served at all
+    (e.g. unidentifiable); served generic devices refuse at audio-open
+    instead (note_audio_refusal)."""
 
     def __init__(self, record, reason):
         self.record = record
@@ -191,10 +195,12 @@ class DeviceRegistry:
         shown = info.display_name or "unnamed"
         self.log(f"routing {info.address} ({shown}, "
                  f"paired={info.paired}) -> {personality}")
-        if personality == PERSONALITY_GLASSES:
-            return Admission(rec, personality)
-        return Admission(rec, personality,
-                         RefusedSlot(rec, GENERIC_NOT_IMPLEMENTED))
+        if info.address == "?":
+            return Admission(rec, personality,
+                             RefusedSlot(rec, UNIDENTIFIED_DEVICE))
+        # Glasses and generic alike are served; the personality picks
+        # the session class (glasses_ag.Profile.NewConnection).
+        return Admission(rec, personality)
 
     # -- session lifecycle -------------------------------------------------
     def attach(self, address, session):
@@ -215,7 +221,7 @@ class DeviceRegistry:
         if prior is not None and getattr(prior, "alive", False):
             self.log(f"device {address}: new session replaces a "
                      "still-live one")
-        if others:
+        if others and rec.personality == PERSONALITY_GLASSES:
             self.log(f"device {address}: other {rec.personality} "
                      f"session(s) live ({', '.join(others)}); the "
                      "shared controller serves the newest")
@@ -232,6 +238,16 @@ class DeviceRegistry:
             rec.last_event = time.time()
         self.log(f"device {address}: session slot cleared")
         return True
+
+    def note_audio_refusal(self, address, reason):
+        """A served device asked for audio and was refused."""
+        with self.lock:
+            rec = self._records.get(address)
+            if rec is None:
+                return
+            rec.audio_refusals += 1
+            rec.last_audio_reason = reason
+            rec.last_event = time.time()
 
     # -- introspection -----------------------------------------------------
     def get(self, address):
@@ -255,6 +271,13 @@ class DeviceRegistry:
             if rec.refusals:
                 line += (f" refusals={rec.refusals} "
                          f"reason=\"{rec.last_reason}\"")
+            sess = rec.session
+            fields = getattr(sess, "status_fields", None)
+            if fields is not None and getattr(sess, "alive", False):
+                line += " " + fields()
+            if rec.audio_refusals:
+                line += (f" audio_refusals={rec.audio_refusals} "
+                         f"audio_reason=\"{rec.last_audio_reason}\"")
             lines.append(line)
         return lines
 

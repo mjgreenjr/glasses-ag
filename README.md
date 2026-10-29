@@ -174,8 +174,12 @@ environment variables.
 - Audio is 16 kHz mono: appropriate for speech, dictation, calls,
   and voice assistants, not high-quality music recording.
 - The WirePlumber configuration leaves the HSP gateway role available
-  so other headsets can still fall back to HSP for their microphones.
-  HSP is narrower-band than HFP/mSBC.
+  for HSP-only headsets, which WirePlumber keeps serving. An HSP
+  fallback for headsets that also speak HFP was measured *not* to
+  materialize on the reference build, so don't rely on it: while
+  glasses-ag is installed it is the HFP stack for the machine. Other
+  HFP headsets get a generic gateway session (service-level connection
+  only so far; their microphone/call audio path is still to come).
 - The daemon logs its local AT-command transcript to the systemd
   journal. Those logs stay on the computer, but review them before
   attaching them to a public bug report; they can contain device

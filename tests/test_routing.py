@@ -110,16 +110,12 @@ def test_glasses_admitted_and_not_refused():
     assert not adm.refused
 
 
-def test_unknown_paired_device_gets_slot_that_refuses_with_reason():
-    reg, logs = registry()
+def test_unknown_paired_device_is_served_generic_not_refused():
+    reg, _ = registry()
     adm = reg.admit(headset())
     assert adm.personality == PERSONALITY_GENERIC
-    assert adm.refused
-    reason = adm.slot.refuse(logs.append)
-    assert "Step B" in reason
-    assert any(HEADSET in l and reason in l for l in logs)
-    assert adm.record.refusals == 1
-    assert adm.record.link() == "refused"
+    assert not adm.refused
+    assert adm.record.refusals == 0
 
 
 def test_unpaired_flag_does_not_gate_admission():
@@ -130,9 +126,13 @@ def test_unpaired_flag_does_not_gate_admission():
 
 
 def test_unreadable_device_is_refused_not_raised():
-    reg, _ = registry()
+    reg, logs = registry()
     adm = reg.admit(DeviceInfo("?"))
     assert adm.refused
+    reason = adm.slot.refuse(logs.append)
+    assert "unreadable" in reason
+    assert any(reason in l for l in logs)
+    assert adm.record.link() == "refused"
 
 
 def test_records_keyed_by_address_case_insensitively():
@@ -179,7 +179,7 @@ def test_refused_device_does_not_disturb_glasses_session():
     g = reg.admit(glasses())
     s = FakeSession()
     reg.attach(GLASSES, s)
-    h = reg.admit(headset())
+    h = reg.admit(DeviceInfo("?"))
     h.slot.refuse()
     h.slot.refuse()
     assert g.record.session is s and g.record.link() == "up"
@@ -224,15 +224,14 @@ def test_status_first_line_is_glasses_status_then_device_sections():
     core = FakeGlassesCore()
     reg.admit(glasses())
     reg.attach(GLASSES, FakeSession())
-    reg.admit(headset()).slot.refuse()
+    reg.admit(headset())
     out = hr.ControlRouter(reg, core).handle("status")
     lines = out.split("\n")
     assert lines[0] == "ok: " + core.status()
     assert len(lines) == 3
     by_addr = {l.split()[1]: l for l in lines[1:]}
     assert "link=up" in by_addr[GLASSES]
-    assert "personality=generic link=refused" in by_addr[HEADSET]
-    assert 'reason="' in by_addr[HEADSET]
+    assert "personality=generic link=down" in by_addr[HEADSET]
 
 
 def test_status_with_no_devices_is_exactly_the_old_reply():
@@ -245,7 +244,8 @@ def test_device_lines_do_not_reuse_glasses_status_keys():
     reg, _ = registry()
     reg.admit(glasses())
     reg.attach(GLASSES, FakeSession())
-    reg.admit(headset()).slot.refuse()
+    reg.admit(headset())
+    reg.note_audio_refusal(HEADSET, "r")
     taken = {"state", "call", "battery", "discord",
              "glasses_connected", "cap_in", "cap"}
     for line in reg.status_sections():
