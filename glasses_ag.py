@@ -12,9 +12,11 @@ negotiation — holds indefinitely).
 
 What it does:
   * Registers org.bluez.Profile1 endpoints for HFP (111e out, 111f in)
-    and holds the service-level connection with the glasses. Any other
-    device's HFP attempt is refused, so other headsets can fall back
-    to HSP via WirePlumber (see 51-glasses-ag.conf).
+    and holds the service-level connection with the glasses. Sessions
+    are per-device objects keyed by Bluetooth address (hfp_registry);
+    the glasses are tenant #1. Any other paired device is routed to
+    a slot that, until the generic personality lands (v2 Step B),
+    refuses service with a logged reason.
   * Dictation (via the `glasses-mic` control command): runs a silent,
     gateway-declared outgoing call (dialing -> alerting -> connected,
     no ring, no gesture), negotiates mSBC, opens SCO, plays a two-blip
@@ -64,6 +66,8 @@ import time
 from array import array
 from collections import deque
 from datetime import datetime
+
+import hfp_registry
 
 try:
     import dbus
@@ -721,10 +725,13 @@ class AGCore:
 # the silent-call dictation flow, and the SCO audio plumbing.
 
 class Session:
-    def __init__(self, sock, device_path, core):
+    def __init__(self, sock, device_path, core, address=None,
+                 registry=None):
         self.sock = sock
         self.device = str(device_path)
         self.core = core
+        self.address = address          # registry key
+        self.registry = registry
         self.lock = threading.Lock()
         self.alive = True
         self.slc = False
@@ -1196,7 +1203,9 @@ class Session:
                     self.core.cap_deadline = None
                     self.core.cap_ceiling = None
                     self.core.cap_warned = False
-            log("session end")
+            if self.registry is not None and self.address:
+                self.registry.detach(self.address, self)
+            log(f"session end: {self.address or self.device}")
 
 
 # --------------------------------------------------------------------------
@@ -1353,23 +1362,21 @@ class MPRISPlayer(dbus.service.Object):
 # (re)connect, or BlueZ never offers us their HFP service.
 
 class Profile(dbus.service.Object):
-    def __init__(self, bus, path, core):
+    def __init__(self, bus, path, core, registry):
         super().__init__(bus, path)
         self.bus = bus
-        self.core = core
+        self.core = core            # the glasses controller (tenant #1)
+        self.registry = registry
 
     @dbus.service.method(PROFILE_IFACE, in_signature="", out_signature="")
     def Release(self):
         log("profile released by BlueZ")
 
-    @dbus.service.method(PROFILE_IFACE, in_signature="oha{sv}",
-                         out_signature="")
-    def NewConnection(self, device, fd, properties):
-        # Gate: serve Meta glasses only. Refusing any other device
-        # here makes its HFP attempt fail fast so it can fall back
-        # (for example, another headset can use HSP via WirePlumber).
-        # Identification is either an exact address pin configured by
-        # the owner, or the glasses' advertised name prefix.
+    def read_device_info(self, device):
+        """Pull the fingerprint inputs for `device` from BlueZ. A
+        failure degrades to an unknown device (address "?"), which
+        routes to the generic slot and is refused with a logged
+        reason — never an exception out of NewConnection."""
         try:
             props = dbus.Interface(
                 self.bus.get_object(BLUEZ, device),
@@ -1377,28 +1384,39 @@ class Profile(dbus.service.Object):
 
             def prop(name):
                 try:
-                    return str(props.Get("org.bluez.Device1", name))
+                    return props.Get("org.bluez.Device1", name)
                 except dbus.DBusException:
-                    return ""
+                    return None
 
-            addr = prop("Address").upper()
-            name = prop("Name") or prop("Alias")
-        except dbus.DBusException:
-            addr = "?"
-            name = ""
-        if GLASSES_MAC:
-            accepted = addr == GLASSES_MAC
-        else:
-            accepted = bool(
-                name and GLASSES_NAME_PREFIX and
-                name.casefold().startswith(GLASSES_NAME_PREFIX.casefold()))
-        if not accepted:
-            log(f"refusing HFP connection from {addr} ({device})")
+            paired = prop("Paired")
+            return hfp_registry.DeviceInfo(
+                str(prop("Address") or ""),
+                name=str(prop("Name") or ""),
+                alias=str(prop("Alias") or ""),
+                paired=None if paired is None else bool(paired),
+                object_path=device)
+        except dbus.DBusException as e:
+            log(f"could not read BlueZ properties for {device}: {e}")
+            return hfp_registry.DeviceInfo("?", object_path=device)
+
+    @dbus.service.method(PROFILE_IFACE, in_signature="oha{sv}",
+                         out_signature="")
+    def NewConnection(self, device, fd, properties):
+        # Admission is BlueZ pairing — no allowlist here. The
+        # fingerprint (hfp_registry.PERSONALITY_RULES) only selects
+        # which personality the device's session slot gets: the
+        # glasses personality for a fingerprint match, otherwise the
+        # generic slot (which, until Step B, refuses with a reason).
+        info = self.read_device_info(device)
+        adm = self.registry.admit(info)
+        if adm.refused:
+            reason = adm.slot.refuse(log)
             raise dbus.exceptions.DBusException(
-                "glasses-ag serves Meta glasses only",
+                f"glasses-ag: {reason}",
                 name="org.bluez.Error.Rejected")
-        if addr and addr != "?":
-            self.core.device_address = addr
+        # Glasses personality.
+        if info.address != "?":
+            self.core.device_address = info.address
         fd_int = fd.take()
         try:
             sock = socket.fromfd(fd_int, socket.AF_BLUETOOTH,
@@ -1406,7 +1424,9 @@ class Profile(dbus.service.Object):
         finally:
             os.close(fd_int)
         sock.settimeout(None)
-        sess = Session(sock, device, self.core)
+        sess = Session(sock, device, self.core, address=info.address,
+                       registry=self.registry)
+        self.registry.attach(info.address, sess)
         with self.core.lock:
             self.core.session = sess
         threading.Thread(target=sess.run, daemon=True).start()
@@ -1441,7 +1461,7 @@ def unregister(bus, path):
 # Control socket: line protocol — start | stop | toggle | media |
 # discord [on|off] | status.
 
-def control_server(core):
+def control_server(router):
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     try:
         os.unlink(CTL_PATH)
@@ -1463,24 +1483,7 @@ def control_server(core):
             except OSError:
                 continue
             cmd = raw.lower()
-            if cmd == "start":
-                reply = core.cmd_start()
-            elif cmd == "stop":
-                reply = core.cmd_stop()
-            elif cmd == "toggle":
-                reply = core.cmd_toggle()
-            elif cmd == "media":
-                reply = core.cmd_media()
-            elif cmd == "discord":
-                reply = core.cmd_discord("toggle")
-            elif cmd == "discord_on":
-                reply = core.cmd_discord("on")
-            elif cmd == "discord_off":
-                reply = core.cmd_discord("off")
-            elif cmd == "status":
-                reply = "ok: " + core.status()
-            else:
-                reply = f"err: unknown command {raw!r}"
+            reply = router.handle(raw)
             if cmd != "status":
                 # Journal the command and its outcome. Clicks and
                 # failed verbs used to leave no trace at all, which
@@ -1514,8 +1517,12 @@ def main():
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
-    Profile(bus, AG_PATH_HF, core)
-    Profile(bus, AG_PATH_AG, core)
+    registry = hfp_registry.DeviceRegistry(
+        hfp_registry.FingerprintConfig(GLASSES_MAC, GLASSES_NAME_PREFIX),
+        log=log)
+    router = hfp_registry.ControlRouter(registry, core)
+    Profile(bus, AG_PATH_HF, core, registry)
+    Profile(bus, AG_PATH_AG, core, registry)
 
     ok = False
     for attempt in range(20):
@@ -1539,9 +1546,10 @@ def main():
         log("FATAL: could not register HFP profiles")
         return 1
 
-    threading.Thread(target=control_server, args=(core,),
+    threading.Thread(target=control_server, args=(router,),
                      daemon=True).start()
-    log("ready — waiting for the glasses to connect")
+    log("ready — waiting for devices to connect "
+        "(glasses -> glasses personality; others -> generic slot)")
     loop = GLib.MainLoop()
     try:
         loop.run()

@@ -42,7 +42,9 @@ def main():
     if not mac:
         return
     card = "bluez_card." + mac.replace(":", "_")
-    status = run("glasses-mic", "status")
+    # First line only: the glasses status. Per-device lines that
+    # follow it are for humans and other tooling.
+    status = (run("glasses-mic", "status").splitlines() or [""])[0]
     kv = dict(tok.split("=", 1) for tok in status.split() if "=" in tok)
 
     if kv.get("glasses_connected") != "True":

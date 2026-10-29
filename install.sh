@@ -19,6 +19,7 @@ RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 echo "== installing files =="
 install -Dm755 glasses_ag.py "$HOME/.local/bin/glasses_ag.py"
+install -Dm644 hfp_registry.py "$HOME/.local/bin/hfp_registry.py"
 install -Dm755 glasses-mic  "$HOME/.local/bin/glasses-mic"
 install -Dm755 glasses-waybar "$HOME/.local/bin/glasses-waybar"
 install -Dm644 glasses-ag.service \

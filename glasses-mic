@@ -9,6 +9,8 @@ discord = toggle Discord mode: tap-to-talk with power saving —
 glasses-mic discord_on arms it, discord_off disarms; while armed a
 temple tap opens the mic and it closes itself on silence.)
 Talks to the daemon's control socket in $XDG_RUNTIME_DIR/glasses-ag/.
+"status" prints the glasses status line first, then one "device ..."
+line per known Bluetooth device.
 Exit status is 0 on an "ok:" reply, 1 on "err:" or no daemon.
 """
 
@@ -32,7 +34,13 @@ def main():
             s.settimeout(5.0)
             s.connect(CTL_PATH)
             s.sendall((sys.argv[1] + "\n").encode())
-            reply = s.recv(512).decode(errors="replace").strip()
+            chunks = []
+            while True:     # status may carry per-device lines
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            reply = b"".join(chunks).decode(errors="replace").strip()
     except OSError as e:
         print(f"glasses-ag daemon not reachable: {e}")
         return 1
