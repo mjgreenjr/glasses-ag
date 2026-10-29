@@ -31,10 +31,12 @@ What it does:
     delivered to the daemon instead of starting a paused music app.
     A tap opens the mic as above; the mic closes itself after ~4 s
     of silence (RMS meter on the decoded stream) or at a 90 s cap,
-    whichever comes first — a descending chirp sounds before the
-    close, and a tap while open resets the cap. A held HFP call is
-    what drains the glasses, so calls now exist only while the user
-    is actually talking.
+    whichever comes first, with a descending chirp before the close.
+    Taps during a call never reach the computer (AVRCP rides the
+    A2DP link, which is parked for the call's duration), so no tap
+    can extend a live session — reopening after a close is one tap.
+    A held HFP call is what drains the glasses, so calls now exist
+    only while the user is actually talking.
 
 Audio path details (all proven on the real hardware, 2026-10-26):
   * SCO packets are 60 bytes: [2-byte header][57-byte mSBC frame]
@@ -88,8 +90,10 @@ GLASSES_NAME_PREFIX = os.environ.get(
 # desktop's AVRCP bridge route the glasses' temple-tap play/pause
 # events to the daemon instead of to a paused music app. A tap opens
 # the mic; the mic closes itself after DISCORD_HANGOVER seconds of
-# silence, or at the DISCORD_CAP hard limit (a tap while open resets
-# the cap). Thresholds are env-tunable for playtesting.
+# silence, or at the DISCORD_CAP hard limit. (Taps DURING a call
+# never reach the PC — AVRCP rides the parked A2DP link and the
+# taps surface on no other channel; verified 2026-10-29. A closed
+# session is reopened with one tap.) Thresholds are env-tunable.
 DISCORD_CAP = float(os.environ.get("GLASSES_AG_DISCORD_CAP", "90"))
 DISCORD_HANGOVER = float(os.environ.get(
     "GLASSES_AG_DISCORD_HANGOVER", "4"))
@@ -533,24 +537,23 @@ class AGCore:
             self.last_voice = time.monotonic()
 
     def on_tap(self):
-        """The temple tap arrived (MPRIS Play/Pause/PlayPause)."""
+        """The temple tap arrived (MPRIS Play/Pause/PlayPause).
+
+        An opener only. During a session the glasses keep their
+        taps to themselves: AVRCP rides the A2DP side, which is
+        parked for the call, and the taps surface on no other
+        channel either (verified on hardware 2026-10-29: 4+ taps
+        during continuous speech produced no AVRCP event, no
+        +CKPD, no +VGS, nothing). A tap observed in a non-ready
+        state is logged for the record and ignored."""
         if not self.discord:
             return
         if self.state == "ready":
             log("discord: tap — opening mic")
             threading.Thread(target=self._tap_open,
                              daemon=True).start()
-        elif self.state in ("starting", "live"):
-            with self.lock:
-                self.cap_deadline = (time.monotonic()
-                                     + DISCORD_CAP)
-            log("discord: tap — safety cap extended")
-            sess = self.session
-            if self.state == "live" and sess is not None:
-                threading.Thread(
-                    target=sess.play_cue_freqs, args=((740,),),
-                    kwargs={"blip": 0.12, "gap": 0.0},
-                    daemon=True).start()
+        else:
+            log(f"discord: tap ignored (state={self.state})")
 
     def _tap_open(self):
         log(f"discord: tap open -> {self.cmd_start()}")

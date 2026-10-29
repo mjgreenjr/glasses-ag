@@ -100,8 +100,11 @@ Then:
 - **Speak, then stop** — after about 4 seconds of silence the
   session closes by itself. A descending chirp sounds just before
   it drops, so the close is never a surprise.
-- **Tap while open** — extends the safety cap (a short blip confirms)
-  if you need the mic held open without speaking.
+- **During a call, taps stay in the glasses.** Temple taps only
+  reach the computer in media mode; once a session is up and A2DP
+  is parked, the glasses keep their taps to themselves, so no tap
+  can extend or end a live session. When a session closes, tap
+  again to reopen — reopening takes about a second.
 - Sessions close automatically at a **90-second safety cap** no
   matter what, so a forgotten open mic can't drain the glasses.
 
