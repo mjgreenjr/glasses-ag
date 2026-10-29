@@ -32,9 +32,12 @@ What it does:
     A tap opens the mic as above; the mic closes itself after ~4 s
     of silence (RMS meter on the decoded stream) or at a 90 s cap,
     whichever comes first, with a descending chirp before the close.
-    Taps during a call never reach the computer (AVRCP rides the
-    A2DP link, which is parked for the call's duration), so no tap
-    can extend a live session — reopening after a close is one tap.
+    If the cap arrives mid-speech it defers instead: a warning tone,
+    then the close lands at the next natural pause — never past a
+    120 s absolute ceiling. Taps during a call never reach the
+    computer (AVRCP rides the A2DP link, which is parked for the
+    call's duration), so no tap can extend a live session —
+    reopening after a close is one tap.
     A held HFP call is what drains the glasses, so calls now exist
     only while the user is actually talking.
 
@@ -99,6 +102,10 @@ DISCORD_HANGOVER = float(os.environ.get(
     "GLASSES_AG_DISCORD_HANGOVER", "4"))
 DISCORD_VAD_RMS = float(os.environ.get(
     "GLASSES_AG_DISCORD_VAD_RMS", "300"))
+# When the cap arrives mid-speech it defers — warn once, close at
+# the next pause — but never past this absolute session ceiling.
+DISCORD_CAP_MAX = float(os.environ.get(
+    "GLASSES_AG_DISCORD_CAP_MAX", "120"))
 MPRIS_NAME = "org.mpris.MediaPlayer2.glassesag"
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 HF_UUID = "0000111e-0000-1000-8000-00805f9b34fb"
@@ -420,6 +427,8 @@ class AGCore:
         self.mpris = None
         self.live_since = None
         self.cap_deadline = None
+        self.cap_ceiling = None
+        self.cap_warned = False
         self.last_voice = 0.0
         self._monitor_started = False
 
@@ -431,9 +440,13 @@ class AGCore:
         if self.battery is not None:
             s += f" battery={self.battery}"
         s += f" discord={'on' if self.discord else 'off'}"
-        if (self.discord and self.state == "live"
-                and self.cap_deadline is not None):
-            s += f" cap_in={max(0, int(self.cap_deadline - time.monotonic()))}s"
+        if self.discord and self.state == "live":
+            if self.cap_warned:
+                s += " cap=deferred"
+            elif self.cap_deadline is not None:
+                remain = max(0, int(self.cap_deadline
+                                    - time.monotonic()))
+                s += f" cap_in={remain}s"
         return s
 
     def cmd_start(self):
@@ -468,6 +481,8 @@ class AGCore:
                 self.state = "ready"
                 self.live_since = None
                 self.cap_deadline = None
+                self.cap_ceiling = None
+                self.cap_warned = False
         if sess and was in ("live", "starting"):
             sess.stop_dictation()
             # Covers a stop issued mid-start (A2DP still parked, the
@@ -524,6 +539,8 @@ class AGCore:
         self.live_since = now
         if self.discord:
             self.cap_deadline = now + DISCORD_CAP
+            self.cap_ceiling = now + max(DISCORD_CAP_MAX, DISCORD_CAP)
+            self.cap_warned = False
             # The tap itself counts as activity: the user gets the
             # full hangover window to start speaking before the
             # silence rule can close the mic.
@@ -573,10 +590,32 @@ class AGCore:
             if self.state != "live":
                 return
             cap = self.cap_deadline
+            ceiling = self.cap_ceiling
+            warned = self.cap_warned
             last_voice = self.last_voice
         now = time.monotonic()
-        if cap is not None and now >= cap:
-            self._discord_close("safety cap reached")
+        if ceiling is not None and now >= ceiling:
+            # The absolute limit: not even continuous speech holds
+            # the session past this — the battery backstop.
+            self._discord_close("absolute cap reached")
+        elif cap is not None and now >= cap:
+            if now - last_voice < DISCORD_HANGOVER:
+                # Mid-speech at the cap: don't guillotine the
+                # sentence. Warn once (a single mid tone, distinct
+                # from the descending close chirp) and defer the
+                # close to the next natural pause.
+                if not warned:
+                    with self.lock:
+                        self.cap_warned = True
+                    log("discord: cap reached mid-speech — "
+                        "deferring close to the next pause")
+                    sess = self.session
+                    if sess is not None:
+                        sess.play_cue_freqs((659,),
+                                            blip=0.25, gap=0.0)
+                return
+            self._discord_close("cap — closed at pause" if warned
+                                else "safety cap reached")
         elif now - last_voice >= DISCORD_HANGOVER:
             self._discord_close("silence")
 
@@ -919,6 +958,8 @@ class Session:
                     self.core.state = "ready"
                     self.core.live_since = None
                     self.core.cap_deadline = None
+                    self.core.cap_ceiling = None
+                    self.core.cap_warned = False
 
     def close_sco(self):
         if self.sco_sock is not None:
@@ -1153,6 +1194,8 @@ class Session:
                     self.core.state = "down"
                     self.core.live_since = None
                     self.core.cap_deadline = None
+                    self.core.cap_ceiling = None
+                    self.core.cap_warned = False
             log("session end")
 
 

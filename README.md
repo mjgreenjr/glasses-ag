@@ -105,8 +105,11 @@ Then:
   is parked, the glasses keep their taps to themselves, so no tap
   can extend or end a live session. When a session closes, tap
   again to reopen — reopening takes about a second.
-- Sessions close automatically at a **90-second safety cap** no
-  matter what, so a forgotten open mic can't drain the glasses.
+- Sessions close automatically at a **90-second safety cap**, so
+  a forgotten open mic can't drain the glasses — with one grace:
+  if you're mid-speech when the cap arrives, a warning tone sounds
+  and the close waits for your next natural pause. An absolute
+  ceiling of **120 seconds** applies no matter what.
 
 Suggested Discord wiring: **Input = Meta Glasses Mic** (it's silent
 while the glasses are in media mode). For **Output**, pick *Meta
@@ -126,7 +129,8 @@ e.g. `Environment=GLASSES_AG_DISCORD_CAP=120`:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GLASSES_AG_DISCORD_CAP` | `90` | hard session limit, seconds |
+| `GLASSES_AG_DISCORD_CAP` | `90` | session cap, seconds (defers to the next pause if you're mid-speech) |
+| `GLASSES_AG_DISCORD_CAP_MAX` | `120` | absolute session ceiling, seconds — no deferral past this |
 | `GLASSES_AG_DISCORD_HANGOVER` | `4` | seconds of silence before auto-close |
 | `GLASSES_AG_DISCORD_VAD_RMS` | `300` | mic level (RMS) that counts as voice |
 
