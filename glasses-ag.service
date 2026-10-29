@@ -1,0 +1,14 @@
+[Unit]
+Description=Meta glasses HFP gateway — microphone daemon (glasses-ag)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/glasses_ag.py
+# Optional: pin the daemon to one pair of glasses by Bluetooth address.
+# Environment=GLASSES_AG_ADDRESS=AA:BB:CC:DD:EE:FF
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,22 @@
+# glasses-ag: expose the daemon's FIFO as a PipeWire source named
+# "glasses-mic" (Meta Glasses Mic) via module-pipe-tunnel — this
+# PipeWire build (1.6.x) has NO libpipewire-module-pipe-source; the
+# pipe-source config killed pipewire.service at startup on
+# 2026-10-26. Property names verified from the module binary itself.
+# The ifexists/nofail flags ensure a module problem can never again
+# be fatal to the audio stack. install.sh substitutes the real
+# runtime directory for __RUNTIME_DIR__.
+context.modules = [
+  { name = libpipewire-module-pipe-tunnel
+    flags = [ ifexists nofail ]
+    args = {
+      tunnel.mode = source
+      pipe.filename = "__RUNTIME_DIR__/glasses-ag/mic.fifo"
+      node.name = "glasses-mic"
+      node.description = "Meta Glasses Mic"
+      audio.format = "S16LE"
+      audio.rate = 16000
+      audio.channels = 1
+    }
+  }
+]

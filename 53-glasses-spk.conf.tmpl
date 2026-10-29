@@ -1,0 +1,22 @@
+# glasses-ag: expose a PipeWire SINK named "glasses-spk" (Meta
+# Glasses Call Audio) via module-pipe-tunnel. Apps (Discord) play
+# call audio into this sink; the tunnel writes the PCM into the
+# daemon's spk.fifo, and the daemon streams it to the glasses over
+# the SCO downlink — full-duplex voice in the glasses while the mic
+# is live, with A2DP parked. Same safety flags as the mic source:
+# a module problem can never be fatal to the audio stack.
+# install.sh substitutes the real runtime directory.
+context.modules = [
+  { name = libpipewire-module-pipe-tunnel
+    flags = [ ifexists nofail ]
+    args = {
+      tunnel.mode = sink
+      pipe.filename = "__RUNTIME_DIR__/glasses-ag/spk.fifo"
+      node.name = "glasses-spk"
+      node.description = "Meta Glasses Call Audio"
+      audio.format = "S16LE"
+      audio.rate = 16000
+      audio.channels = 1
+    }
+  }
+]

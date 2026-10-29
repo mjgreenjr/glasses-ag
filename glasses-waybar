@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Waybar custom module for glasses-ag: shows the Meta glasses on
+the bar while they're connected, with battery + mic/call status in
+the tooltip. Prints nothing when the glasses are away, so the
+module collapses. Click toggles the microphone (wired up in the
+Waybar config's on-click).
+
+Output is Waybar JSON: {"text", "tooltip", "class"} — classes:
+glasses ready | live | daemon-down (style them in style.css).
+"""
+import json
+import os
+import re
+import subprocess
+
+NAME_PREFIX = os.environ.get("GLASSES_AG_NAME_PREFIX", "Meta Glasses")
+PINNED_MAC = os.environ.get("GLASSES_AG_ADDRESS", "").strip().upper()
+ICON = "\uf530"          # Nerd Font: Font Awesome "glasses"
+
+
+def run(*args):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True,
+                           timeout=4)
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def glasses_mac():
+    if PINNED_MAC:
+        return PINNED_MAC
+    for line in run("bluetoothctl", "devices").splitlines():
+        m = re.match(r"Device ([0-9A-Fa-f:]{17}) (.+)$", line.strip())
+        if m and m.group(2).casefold().startswith(NAME_PREFIX.casefold()):
+            return m.group(1).upper()
+    return ""
+
+
+def main():
+    mac = glasses_mac()
+    if not mac:
+        return
+    card = "bluez_card." + mac.replace(":", "_")
+    status = run("glasses-mic", "status")
+    kv = dict(tok.split("=", 1) for tok in status.split() if "=" in tok)
+
+    if kv.get("glasses_connected") != "True":
+        # Only speak up in one case: Bluetooth sees the glasses but
+        # the daemon doesn't — that's a problem worth a red icon.
+        if "Connected: yes" in run("bluetoothctl", "info", mac):
+            print(json.dumps({
+                "text": ICON,
+                "class": "glasses daemon-down",
+                "tooltip": "Meta Glasses connected,\n"
+                           "but glasses-ag is not running"}))
+        return
+
+    state = kv.get("state", "?")
+    call = kv.get("call", "?")
+    batt = kv.get("battery")
+
+    lines = ["Meta Glasses"]
+    if batt:
+        lines.append(f"Battery: {batt}%")
+    lines.append({"live": "Microphone: LIVE",
+                  "ready": "Microphone: ready",
+                  "starting": "Microphone: starting…"}.get(
+                      state, f"State: {state}"))
+    if call not in ("idle", "none", "?"):
+        lines.append(f"Call: {call}")
+    m = re.search(r"Name: " + re.escape(card) +
+                  r"\n(?:.*\n)*?\tActive Profile: (\S+)",
+                  run("pactl", "list", "cards"))
+    if m:
+        lines.append("Audio: " + {
+            "a2dp-sink": "Media (A2DP stereo)",
+            "off": "Call mode (A2DP parked)"}.get(m.group(1),
+                                                  m.group(1)))
+    lines.append("Click: toggle microphone")
+
+    print(json.dumps({
+        "text": ICON + (f" {batt}%" if batt else ""),
+        "class": f"glasses {state}",
+        "tooltip": "\n".join(lines)}))
+
+
+if __name__ == "__main__":
+    main()

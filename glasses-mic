@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""glasses-mic — control the glasses-ag daemon.
+
+Usage: glasses-mic start | stop | toggle | status | media
+(media = end any call session and put the glasses back in speaker
+mode, restoring A2DP even if another process parked it.)
+Talks to the daemon's control socket in $XDG_RUNTIME_DIR/glasses-ag/.
+Exit status is 0 on an "ok:" reply, 1 on "err:" or no daemon.
+"""
+
+import os
+import socket
+import sys
+
+CTL_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    "glasses-ag", "ctl")
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in (
+            "start", "stop", "toggle", "status", "media"):
+        print(__doc__.strip())
+        return 2
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5.0)
+            s.connect(CTL_PATH)
+            s.sendall((sys.argv[1] + "\n").encode())
+            reply = s.recv(512).decode(errors="replace").strip()
+    except OSError as e:
+        print(f"glasses-ag daemon not reachable: {e}")
+        return 1
+    print(reply)
+    return 0 if reply.startswith("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
