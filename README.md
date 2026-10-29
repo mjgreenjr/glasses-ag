@@ -28,6 +28,9 @@ back over the same voice link.
 A2DP is parked while a call session is live and restored afterward,
 matching normal phone-call behavior.
 
+glasses-ag also serves your **other paired HFP headsets** with a
+standard gateway — see [Other headsets](#other-headsets-generic-hfp).
+
 No Meta account, cloud service, or network connection is involved.
 Pairing is ordinary Bluetooth pairing between the glasses and the
 computer.
@@ -38,6 +41,8 @@ computer.
 - Python 3
 - `dbus-python` and PyGObject
 - `libsbc` for mSBC decoding and encoding
+- `pw-cli` and `pactl` on `PATH` (PipeWire and its PulseAudio
+  compatibility layer) — only needed for non-glasses headsets
 - The glasses paired with the computer before starting
 
 The included installer is written for Arch-like systems and checks
@@ -59,6 +64,7 @@ The installer is user-level and installs:
 | File | Destination |
 |---|---|
 | `glasses_ag.py` | `~/.local/bin/` |
+| `hfp_registry.py`, `hfp_generic.py`, `hfp_media.py`, `hfp_audio.py` | `~/.local/bin/` (imported by the daemon) |
 | `glasses-mic` | `~/.local/bin/` |
 | `glasses-waybar` | `~/.local/bin/` |
 | `glasses-ag.service` | `~/.config/systemd/user/` |
@@ -77,6 +83,10 @@ glasses-mic stop      # end the session and restore A2DP
 glasses-mic toggle
 glasses-mic media     # force the glasses back to media/A2DP mode
 ```
+
+`status` prints the glasses line first, then one `device …` line per
+known Bluetooth device. Every verb without a device argument targets
+the glasses, exactly as before.
 
 ## Discord mode (tap-to-talk, power saving)
 
@@ -143,11 +153,69 @@ bind = SUPER SHIFT, M, exec, glasses-mic toggle
 See [BAR.md](BAR.md) for an optional bar module that displays state
 and battery.
 
+## Other headsets (generic HFP)
+
+**While glasses-ag is installed it serves the HFP Audio Gateway role
+for your paired headsets.** WirePlumber's native HFP stays off
+(`51-glasses-ag.conf`), so the daemon — not WirePlumber — answers
+every paired device that connects over HFP. Uninstalling glasses-ag
+(and removing that file) restores WirePlumber's behavior completely.
+HSP-only headsets are untouched: WirePlumber keeps the HSP role.
+
+Admission is ordinary Bluetooth pairing/trust; there is no allowlist.
+Devices whose name starts with `Meta Glasses` (or the pinned address,
+below) get the glasses behavior; every other paired device gets a
+standard phone-like gateway: the connection stays up, and the call
+audio link opens only when it is wanted.
+
+Each such headset gets its own PipeWire nodes, named after the device
+as it presents itself, e.g. **Corsair HS55 Mic** (source) and
+**Corsair HS55 Call Audio** (sink). They exist while the headset is
+connected. Pick them in your voice app like any other device.
+
+The call audio link (and so the headset's microphone) opens when
+either:
+
+- the headset asks (its call/mic button, `AT+BCC`), or
+- an app attaches a stream to the device's **Mic** source or **Call
+  Audio** sink (checked by polling `pactl` about once a second).
+
+It closes when the headset drops it, or — if an app opened it — when
+the app detaches. There are no timers and no voice detection for
+headsets. While the call link is open, the headset's A2DP (music)
+profile is parked and restored when it closes, like a phone call.
+Note that an app holding the Mic source open all the time (a voice
+app left on that input) keeps the headset in call mode; so do
+monitoring streams such as a mixer's level meter. `glasses-mic start
+<device>` / `stop <device>` open and close it by hand, and
+`glasses-mic status <device>` shows one device in detail; a device is
+named by Bluetooth address or by name (`glasses-mic start corsair`).
+
+**One call at a time.** Any number of headsets may stay connected, but
+only one call audio link exists across all devices — the glasses
+count as one. A second device asking for audio while a call is live is
+refused with a logged reason, and shows up as `audio_refusals` on its
+`status` line.
+
+### Known limitation: a second connected device can block glasses call audio
+
+On a single Bluetooth adapter, a second connected headset can block
+the glasses' call audio. Observed on a Realtek adapter: while any
+second device is connected (even idle), the controller refuses the
+glasses' synchronous connection (HCI status `0x1F`; the daemon logs
+`Errno 38`, then `111`); disconnecting the other device cures it
+immediately. Reproduced with two different vendors' headsets. Behavior
+may vary by adapter. **Disconnect or power off other headsets before a
+glasses call.** When a call-audio connection fails while another
+device is connected, the journal names this likely cause and the
+device's `status` line carries it as `audio_reason`. When the glasses
+are not in a call, other headsets get full service.
+
 ## Device selection and configuration
 
-By default, the daemon accepts an HFP connection only from a device
-whose advertised Bluetooth name starts with `Meta Glasses`. That
-prevents it from taking HFP connections away from unrelated headsets.
+By default, the daemon gives the glasses behavior to a device whose
+advertised Bluetooth name starts with `Meta Glasses`; every other
+paired device is served as a generic headset (above).
 
 To pin it to one specific pair, set the Bluetooth address in
 `~/.config/systemd/user/glasses-ag.service`:
@@ -178,8 +246,10 @@ environment variables.
   fallback for headsets that also speak HFP was measured *not* to
   materialize on the reference build, so don't rely on it: while
   glasses-ag is installed it is the HFP stack for the machine. Other
-  HFP headsets get a generic gateway session (service-level connection
-  only so far; their microphone/call audio path is still to come).
+  HFP headsets are served by the generic gateway (see above).
+- Call audio is one call at a time across all devices, and a second
+  connected device can block the glasses' call audio on some adapters
+  (see *Known limitation*).
 - The daemon logs its local AT-command transcript to the systemd
   journal. Those logs stay on the computer, but review them before
   attaching them to a public bug report; they can contain device
@@ -200,6 +270,11 @@ environment variables.
 - **No `glasses-mic` source in `wpctl status`:** check that the
   generated `52-glasses-mic.conf` uses the current
   `$XDG_RUNTIME_DIR`, then restart `pipewire.service`.
+- **A headset connects but has no `… Mic` source:** the journal line
+  `audio provisioning FAILED` gives the reason (usually `pw-cli` not
+  on `PATH`, or the PipeWire `pipe-tunnel` module missing). The
+  headset's connection and A2DP are unaffected; audio-open is refused
+  until the next attempt succeeds (retried at most every 30 s).
 - **Microphone is live but silent in an app:** select the
   **glasses-mic** source in the app or with `wpctl set-default`; the
   system default may point at another microphone.
@@ -208,7 +283,8 @@ environment variables.
 
 ```sh
 systemctl --user disable --now glasses-ag.service
-rm ~/.local/bin/glasses_ag.py ~/.local/bin/glasses-mic ~/.local/bin/glasses-waybar
+rm ~/.local/bin/glasses_ag.py ~/.local/bin/hfp_{registry,generic,media,audio}.py
+rm ~/.local/bin/glasses-mic ~/.local/bin/glasses-waybar
 rm ~/.config/systemd/user/glasses-ag.service
 rm ~/.config/wireplumber/wireplumber.conf.d/51-glasses-ag.conf
 rm ~/.config/pipewire/pipewire.conf.d/52-glasses-mic.conf
@@ -218,4 +294,5 @@ systemctl --user restart pipewire.service wireplumber.service
 ```
 
 Removing the WirePlumber configuration returns HFP ownership to
-PipeWire/WirePlumber.
+PipeWire/WirePlumber, and your headsets go back to being handled by it
+as before.

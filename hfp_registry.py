@@ -258,28 +258,68 @@ class DeviceRegistry:
         with self.lock:
             return list(self._records.values())
 
+    def live_peers(self, address):
+        """(address, name) of every OTHER device that currently holds
+        an RFCOMM/SLC link — the input to the multi-device SCO
+        diagnostic."""
+        out = []
+        for rec in sorted(self.records(), key=lambda r: r.address):
+            if rec.address == address:
+                continue
+            if rec.link() in ("up", "connecting"):
+                out.append((rec.address, rec.name))
+        return out
+
+    def device_line(self, rec, detail=False):
+        name = (rec.name or "").replace('"', "'")
+        line = (f"device {rec.address} name=\"{name}\" "
+                f"personality={rec.personality} link={rec.link()}")
+        if rec.refusals:
+            line += (f" refusals={rec.refusals} "
+                     f"reason=\"{rec.last_reason}\"")
+        sess = rec.session
+        fields = getattr(sess, "status_fields", None)
+        if fields is not None and getattr(sess, "alive", False):
+            line += " " + fields()
+            more = getattr(sess, "detail_fields", None)
+            if detail and more is not None:
+                line += " " + more()
+        if rec.audio_refusals:
+            line += (f" audio_refusals={rec.audio_refusals} "
+                     f"audio_reason=\"{rec.last_audio_reason}\"")
+        return line
+
     def status_sections(self):
         """One line per known device, for the lines AFTER the glasses
         status line. Keys are deliberately distinct from the glasses
         line's keys (state/call/battery/discord/glasses_connected/
         cap_in) so a key=value scraper never confuses the two."""
-        lines = []
-        for rec in sorted(self.records(), key=lambda r: r.address):
-            name = (rec.name or "").replace('"', "'")
-            line = (f"device {rec.address} name=\"{name}\" "
-                    f"personality={rec.personality} link={rec.link()}")
-            if rec.refusals:
-                line += (f" refusals={rec.refusals} "
-                         f"reason=\"{rec.last_reason}\"")
-            sess = rec.session
-            fields = getattr(sess, "status_fields", None)
-            if fields is not None and getattr(sess, "alive", False):
-                line += " " + fields()
-            if rec.audio_refusals:
-                line += (f" audio_refusals={rec.audio_refusals} "
-                         f"audio_reason=\"{rec.last_audio_reason}\"")
-            lines.append(line)
-        return lines
+        return [self.device_line(rec)
+                for rec in sorted(self.records(),
+                                  key=lambda r: r.address)]
+
+    def resolve(self, selector):
+        """Find one device by address (any case) or by name: exact
+        match first, then a unique case-insensitive substring.
+        Returns (record, None) or (None, error text)."""
+        sel = (selector or "").strip()
+        recs = self.records()
+        for r in recs:
+            if r.address.upper() == sel.upper():
+                return r, None
+        low = sel.casefold()
+        hits = [r for r in recs if (r.name or "").casefold() == low]
+        if not hits:
+            hits = [r for r in recs if low and low in
+                    (r.name or "").casefold()]
+        if len(hits) == 1:
+            return hits[0], None
+        if not hits:
+            known = ", ".join(f"{r.address} ({r.name or 'unnamed'})"
+                              for r in recs) or "none"
+            return None, f"no such device {selector!r} (known: {known})"
+        return None, (f"{selector!r} is ambiguous: " + ", ".join(
+            f"{r.address} ({r.name or 'unnamed'})" for r in hits))
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +328,10 @@ class DeviceRegistry:
 
 CONTROL_VERBS = ("start", "stop", "toggle", "status", "media",
                  "discord", "discord_on", "discord_off")
+# Verbs that also accept one device selector (address or name):
+# `status <dev>`, `start <dev>`, `stop <dev>`, `toggle <dev>`. Without
+# a selector they target the glasses exactly as before.
+DEVICE_VERBS = ("status", "start", "stop", "toggle")
 
 
 class ControlRouter:
@@ -316,4 +360,43 @@ class ControlRouter:
             lines = ["ok: " + g.status()]
             lines += self.registry.status_sections()
             return "\n".join(lines)
+        parts = raw.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in DEVICE_VERBS:
+            return self._device_verb(parts[0].lower(), parts[1].strip())
         return f"err: unknown command {raw!r}"
+
+    def _device_verb(self, verb, selector):
+        reg = self.registry
+        g = self.glasses
+        rec = None
+        if selector.casefold() == "glasses":
+            is_glasses = True
+            rec = next((r for r in reg.records()
+                        if r.personality == PERSONALITY_GLASSES), None)
+        else:
+            rec, err = reg.resolve(selector)
+            if rec is None:
+                return f"err: {err}"
+            is_glasses = rec.personality == PERSONALITY_GLASSES
+        if is_glasses:
+            if verb == "status":
+                lines = ["ok: " + g.status()]
+                if rec is not None:
+                    lines.append(reg.device_line(rec, detail=True))
+                return "\n".join(lines)
+            return {"start": g.cmd_start, "stop": g.cmd_stop,
+                    "toggle": g.cmd_toggle}[verb]()
+        if verb == "status":
+            return "ok: " + reg.device_line(rec, detail=True)
+        sess = rec.session
+        if sess is None or not getattr(sess, "alive", False):
+            return f"err: {rec.address} is not connected"
+        audio = getattr(sess, "audio", None)
+        if audio is None:
+            return f"err: no audio path for {rec.address}"
+        if verb == "start":
+            return audio.control_start()
+        if verb == "stop":
+            return audio.control_stop()
+        return audio.control_stop() if audio.state != "idle" \
+            else audio.control_start()

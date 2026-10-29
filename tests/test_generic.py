@@ -2,6 +2,8 @@
 fake RFCOMM socket. No Bluetooth, PipeWire, or root. Nothing here is
 hardware verification."""
 
+import pytest
+
 import hfp_generic as hg
 from hfp_registry import (DeviceInfo, DeviceRegistry, FingerprintConfig)
 
@@ -301,7 +303,7 @@ def test_bac_garbage_is_error():
     assert replies(say(sess, sock, "AT+BAC=a,b")) == ["ERROR"]
 
 
-# -- audio-open refusal (Step B boundary) ---------------------------------
+# -- audio-open refusal on a bare session (no audio manager) ------------
 
 def test_bcc_is_refused_cleanly_with_logged_reason():
     sess, sock, reg, logs = make()
@@ -310,7 +312,7 @@ def test_bcc_is_refused_cleanly_with_logged_reason():
     assert sess.alive and sess.slc               # link untouched
     rec = reg.get(ADDR)
     assert rec.audio_refusals == 1
-    assert "Step C" in rec.last_audio_reason
+    assert "no audio manager" in rec.last_audio_reason
     assert any("audio-open refused (AT+BCC)" in l for l in logs)
     assert rec.link() == "up"                    # not a connect refusal
     assert 'audio_refusals=1' in reg.status_sections()[0]
@@ -321,7 +323,7 @@ def test_bcc_is_refused_cleanly_with_logged_reason():
 def test_unknown_at_gets_clean_error_and_link_survives():
     sess, sock, _, _ = make()
     connect_full(sess, sock)
-    for cmd in ("AT+XYZZY=1", "AT+IPHONEACCEV=1,1,5", "AT+XAPL=ab-cd,2",
+    for cmd in ("AT+XYZZY=1", "AT+XAPL=ab-cd,2",
                 "AT+NREC=0", "AT+CMEE=1", "ATZ", "garbage", "AT+"):
         assert replies(say(sess, sock, cmd)) == ["ERROR"], cmd
     assert sess.alive and sess.slc
@@ -380,3 +382,49 @@ def test_status_fields_do_not_collide_with_glasses_keys():
     keys = {t.split("=", 1)[0] for t in line.split() if "=" in t}
     assert not keys & {"state", "call", "battery", "discord",
                        "glasses_connected", "cap_in", "cap"}
+
+
+# -- Apple IPHONEACCEV battery dialect (Corsair HS55 quirk) ----------------
+
+def test_iphoneaccev_battery_is_accepted_and_stored():
+    sess, sock, _, logs = make()
+    connect_full(sess, sock)
+    assert replies(say(sess, sock, "AT+IPHONEACCEV=1,1,5")) == ["OK"]
+    assert sess.hf_battery == 50                 # level 5 of 9 -> x10
+    assert "hf_battery=50" in sess.status_fields()
+    assert any("IPHONEACCEV dialect accepted" in l for l in logs)
+    assert sess.alive and sess.slc
+
+
+def test_iphoneaccev_multiple_pairs_and_dock_key():
+    sess, sock, _, _ = make()
+    assert replies(say(sess, sock, "AT+IPHONEACCEV=2,1,9,2,0")) == ["OK"]
+    assert sess.hf_battery == 90
+    # dock-only report: accepted, battery untouched
+    assert replies(say(sess, sock, "AT+IPHONEACCEV=1,2,0")) == ["OK"]
+    assert sess.hf_battery == 90
+
+
+def test_iphoneaccev_level_is_clamped_and_repeat_not_relogged():
+    sess, sock, _, logs = make()
+    say(sess, sock, "AT+IPHONEACCEV=1,1,20")
+    assert sess.hf_battery == 100
+    say(sess, sock, "AT+IPHONEACCEV=1,1,20")
+    assert sum("battery" in l for l in logs) == 1
+
+
+@pytest.mark.parametrize("arg", ["", "x", "1,1", "2,1,5", "-1", "1,1,a"])
+def test_iphoneaccev_malformed_is_a_clean_error(arg):
+    sess, sock, _, _ = make()
+    assert replies(say(sess, sock, f"AT+IPHONEACCEV={arg}")) == ["ERROR"]
+    assert sess.hf_battery is None and sess.alive
+
+
+def test_devices_that_never_send_iphoneaccev_are_unaffected():
+    sess, sock, _, _ = make()
+    connect_full(sess, sock)
+    assert sess.hf_battery is None
+    assert "hf_battery" not in sess.status_fields()
+    # the spec path still works alongside
+    assert replies(say(sess, sock, "AT+BIEV=2,40")) == ["OK"]
+    assert sess.hf_battery == 40

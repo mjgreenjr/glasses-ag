@@ -3,6 +3,7 @@
 
 Usage: glasses-mic start | stop | toggle | status | media |
        discord | discord_on | discord_off
+       glasses-mic status|start|stop|toggle <device>
 (media = end any call session and put the glasses back in speaker
 mode, restoring A2DP even if another process parked it.
 discord = toggle Discord mode: tap-to-talk with power saving —
@@ -10,7 +11,11 @@ glasses-mic discord_on arms it, discord_off disarms; while armed a
 temple tap opens the mic and it closes itself on silence.)
 Talks to the daemon's control socket in $XDG_RUNTIME_DIR/glasses-ag/.
 "status" prints the glasses status line first, then one "device ..."
-line per known Bluetooth device.
+line per known Bluetooth device. With a <device> (Bluetooth address, or
+a name such as "Corsair HS55") the verb targets that device instead of
+the glasses: "status <device>" prints its detail line; "start"/"stop"
+/"toggle" open or close its call audio. Without one, every verb
+targets the glasses exactly as before.
 Exit status is 0 on an "ok:" reply, 1 on "err:" or no daemon.
 """
 
@@ -24,16 +29,20 @@ CTL_PATH = os.path.join(
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in (
-            "start", "stop", "toggle", "status", "media",
-            "discord", "discord_on", "discord_off"):
+    verbs = ("start", "stop", "toggle", "status", "media",
+             "discord", "discord_on", "discord_off")
+    device_verbs = ("start", "stop", "toggle", "status")
+    ok = (len(sys.argv) == 2 and sys.argv[1] in verbs) or (
+        len(sys.argv) == 3 and sys.argv[1] in device_verbs)
+    if not ok:
         print(__doc__.strip())
         return 2
+    request = " ".join(sys.argv[1:])
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(5.0)
             s.connect(CTL_PATH)
-            s.sendall((sys.argv[1] + "\n").encode())
+            s.sendall((request + "\n").encode())
             chunks = []
             while True:     # status may carry per-device lines
                 chunk = s.recv(4096)

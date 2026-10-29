@@ -13,11 +13,13 @@ the call table is empty and stays empty), +BAC codec negotiation
 vocabulary. It shares nothing with the glasses' Samsung-replica script
 (AGCore/Session); the glasses personality is untouched.
 
-STEP B BOUNDARY: SLC only. The audio path (per-device PipeWire
-provisioning, SCO) is Step C. Every audio-open request — AT+BCC, or the
-device's own attempt — goes through GenericSession.request_audio(),
-which in this step refuses cleanly with a logged reason. Step C
-replaces `audio_opener`; nothing here fakes a call to get audio.
+AUDIO BOUNDARY: every audio-open request — AT+BCC, the codec
+confirmation, an app attaching to the device's nodes, a control verb —
+goes through GenericSession.request_audio(). A bare session (no audio
+manager attached, as in unit tests) refuses cleanly with a logged
+reason; in the daemon hfp_audio.AudioManager.attach() installs
+`audio_opener` and the hooks below (v2 Step C). Nothing here fakes a
+call to get audio.
 
 Nothing in this module is hardware-verified.
 """
@@ -62,8 +64,8 @@ HFI_SAFETY = 1          # enhanced safety (0/1)
 HFI_BATTERY = 2         # battery level (0-100)
 HFI_SUPPORTED = (HFI_SAFETY, HFI_BATTERY)
 
-AUDIO_NOT_IMPLEMENTED = ("generic audio path not implemented yet "
-                         "(v2 Step C); SLC only")
+AUDIO_NOT_IMPLEMENTED = ("no audio manager attached to this session; "
+                         "SLC only")
 
 MAX_LINE_BUFFER = 4096
 
@@ -114,8 +116,13 @@ class GenericSession:
         # codec connection state
         self.codec_offered = None
         self.codec_confirmed = None
-        # Step C replaces this; Step B refuses at audio-open.
+        # hfp_audio.AudioManager.attach() replaces these; a bare
+        # session refuses at audio-open.
         self.audio_opener = self._refuse_audio
+        self.audio = None               # GenericAudio, when attached
+        self.audio_post_ack = None      # run after OK to AT+BCC
+        self.slc_hooks = []             # run once when the SLC is up
+        self.end_hooks = []             # run when the session ends
 
     # -- plumbing ----------------------------------------------------------
     def send(self, text):
@@ -164,7 +171,7 @@ class GenericSession:
         if self.indicator_reporting and self.ind_enabled[i]:
             self.send(f"\r\n+CIEV: {i + 1},{value}\r\n")
 
-    # -- audio-open gate (Step B refuses; Step C replaces) -----------------
+    # -- audio-open gate ----------------------------------------------------
     def request_audio(self, source):
         return self.audio_opener(source)
 
@@ -180,8 +187,8 @@ class GenericSession:
     def begin_codec_offer(self):
         """Pick the codec. A negotiating headset gets +BCS:<id> and
         must confirm with AT+BCS; a non-negotiating one is CVSD by
-        definition. Returns the codec id. (Step C's audio open calls
-        this; nothing in Step B does.)"""
+        definition. Returns the codec id. (hfp_audio's audio open
+        calls this.)"""
         codec = self.selected_codec()
         self.codec_confirmed = None
         if self.codec_negotiation:
@@ -202,7 +209,21 @@ class GenericSession:
         out = f"codec={codec}"
         if self.hf_battery is not None:
             out += f" hf_battery={self.hf_battery}"
+        if self.audio is not None:
+            out += " " + self.audio.status_fields()
         return out
+
+    def detail_fields(self):
+        """The `glasses-mic status <device>` extras."""
+        parts = [f"hf_features={self.hf_features}",
+                 f"hf_codecs={','.join(str(c) for c in self.hf_codecs) or 'none'}"]
+        if self.speaker_gain is not None:
+            parts.append(f"vgs={self.speaker_gain}")
+        if self.mic_gain is not None:
+            parts.append(f"vgm={self.mic_gain}")
+        if self.audio is not None:
+            parts.append(self.audio.detail_fields())
+        return " ".join(parts)
 
     # -- SLC steps ---------------------------------------------------------
     def _maybe_slc(self, force=False):
@@ -220,6 +241,14 @@ class GenericSession:
                  f"({self.name or 'unnamed'}; hf_features={self.hf_features}"
                  f", codecs={self.hf_codecs or 'none (CVSD)'}, "
                  f"pick={self.selected_codec()})")
+        self._run_hooks(self.slc_hooks)
+
+    def _run_hooks(self, hooks):
+        for hook in list(hooks):
+            try:
+                hook()
+            except Exception as e:      # a hook must never kill the SLC
+                self.log(f"[{self.address}] hook error: {e!r}")
 
     def _on_brsf(self, arg):
         try:
@@ -404,6 +433,9 @@ class GenericSession:
                      "connection (AT+BCC)")
             if self.request_audio("AT+BCC"):
                 self.send(OK)
+                # The codec offer (+BCS) must follow our OK.
+                if self.audio_post_ack is not None:
+                    self._run_hooks([self.audio_post_ack])
             else:
                 self.send(ERROR)
         elif u.startswith("AT+BCS="):
@@ -422,8 +454,8 @@ class GenericSession:
         elif u.startswith("AT+CKPD="):
             self._force_slc_if_ready()
             if u == "AT+CKPD=200":
-                # Headset button press. With no call to act on and the
-                # audio path deferred to Step C, acknowledge and note.
+                # Headset button press. There is never a call to act on
+                # (the call table is empty), so acknowledge and note.
                 self.log(f"[{self.address}] headset button (CKPD=200): "
                          "no call to act on")
                 self.send(OK)
@@ -446,14 +478,44 @@ class GenericSession:
             self.send("\r\n+COPS: 0\r\n" + OK)
         elif u == "AT+CNUM":
             self.send(OK)           # no subscriber numbers
+        elif u.startswith("AT+IPHONEACCEV="):
+            self._on_iphoneaccev(u[15:])
         elif u == "AT":
             self.send(OK)
         else:
             # Everything else — ATA/ATD/AT+CHUP with no call, NREC,
-            # CMEE, BTRH, BSIR, vendor extensions (XAPL, IPHONEACCEV,
-            # …) — is unsupported here: clean ERROR, link stays up.
+            # CMEE, BTRH, BSIR, other vendor extensions (XAPL, …) —
+            # is unsupported here: clean ERROR, link stays up.
             self.log(f"[{self.address}] unsupported command {cmd!r}")
             self.send(ERROR)
+
+    def _on_iphoneaccev(self, arg):
+        """Apple accessory battery dialect: <count>,<key>,<val>,...
+        Key 1 = battery level 0-9 (stored x10, like the glasses side),
+        key 2 = dock state (ignored). Accepted as a DIALECT, not a
+        quirk-table gate: some headsets (the Corsair HS55) report
+        battery only this way and ignore the spec indicator path. A
+        device that never sends it is unaffected."""
+        try:
+            fields = _ints(arg)
+        except ValueError:
+            self.send(ERROR)
+            return
+        if not fields or fields[0] < 0 \
+                or len(fields) != 1 + 2 * fields[0]:
+            self.log(f"[{self.address}] malformed IPHONEACCEV {arg!r}")
+            self.send(ERROR)
+            return
+        pairs = fields[1:]
+        for i in range(0, len(pairs), 2):
+            if pairs[i] == 1:
+                pct = max(0, min(100, pairs[i + 1] * 10))
+                if self.hf_battery != pct:
+                    self.log(f"[{self.address}] headset battery: ~{pct}% "
+                             f"(Apple level {pairs[i + 1]}; "
+                             "IPHONEACCEV dialect accepted)")
+                self.hf_battery = pct
+        self.send(OK)
 
     def _force_slc_if_ready(self):
         self._maybe_slc(force=True)
@@ -477,7 +539,7 @@ class GenericSession:
             self.codec_offered = None
             self.log(f"[{self.address}] codec {codec} confirmed")
             self.send(OK)
-            # Step C: the SCO open follows confirmation.
+            # The SCO open follows confirmation.
             self.request_audio("codec confirmed")
 
     # -- main loop ---------------------------------------------------------
@@ -516,6 +578,7 @@ class GenericSession:
                 self.sock.close()
             except OSError:
                 pass
+            self._run_hooks(self.end_hooks)
             if self.registry is not None and self.address:
                 self.registry.detach(self.address, self)
             self.log(f"[{self.address}] generic session end")
