@@ -628,7 +628,11 @@ class AGCore:
         with self.lock:
             self.a2dp_parked = True
         log("parked glasses A2DP for dictation start")
-        time.sleep(0.8)                 # let the transport fully close
+        # Let the transport close before the SCO attempt. Was 0.8 s;
+        # trimmed 2026-10-29 for tap-to-talk latency — the SCO
+        # worker's retry loop (12 attempts over ~3 s) absorbs the
+        # remaining drain variance.
+        time.sleep(0.2)
 
     def restore_a2dp(self):
         with self.lock:
@@ -933,13 +937,17 @@ class Session:
 
     def _call_sequence(self):
         # Silent gateway-declared outgoing call: no RING, no gesture.
+        # The phase pacing was 0.4/0.6 s (phone-like); trimmed
+        # 2026-10-29 because tap-to-talk made the dead time audible —
+        # the glasses track the CIEV values, not the wall clock. If
+        # call setup ever gets flaky, restore the slower pacing.
         self.send("\r\n+CIEV: 3,2\r\n")              # callsetup = dialing
-        time.sleep(0.4)
+        time.sleep(0.15)
         if self.call_state != "dialing":
             return
         self.clcc_stat = 3
         self.send("\r\n+CIEV: 3,3\r\n")              # callsetup = alerting
-        time.sleep(0.6)
+        time.sleep(0.25)
         if self.call_state != "dialing":
             return
         self.call_state = "active"
