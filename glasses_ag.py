@@ -1481,6 +1481,14 @@ def control_server(core):
                 reply = "ok: " + core.status()
             else:
                 reply = f"err: unknown command {raw!r}"
+            if cmd != "status":
+                # Journal the command and its outcome. Clicks and
+                # failed verbs used to leave no trace at all, which
+                # hid a failed widget toggle during debugging
+                # (2026-10-29). "status" is exempt on purpose: the
+                # bar polls it, and logging a pure read on every
+                # poll would bury the journal.
+                log(f"control: {raw} -> {reply}")
             try:
                 conn.sendall((reply + "\n").encode())
             except OSError:
