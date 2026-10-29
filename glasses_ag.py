@@ -648,7 +648,14 @@ class AGCore:
 
     @property
     def CARD(self):
-        addr = self.device_address or GLASSES_MAC
+        # The live glasses session's own address wins over the shared
+        # core.device_address (a controller-wide scalar that outlives
+        # sessions and must never be what picks a device).
+        sess = self.session
+        addr = (getattr(sess, "address", None) if sess else None) \
+            or self.device_address or GLASSES_MAC
+        if addr == "?":
+            addr = self.device_address or GLASSES_MAC
         return "bluez_card." + addr.replace(":", "_") if addr else ""
 
     def _pactl(self, *args):
@@ -782,7 +789,13 @@ class Session:
         s = None
         try:
             last = None
-            address = self.core.device_address or GLASSES_MAC
+            # Always THIS session's own device — never a controller-wide
+            # or registry-derived address (other devices may be
+            # connected). core.device_address is only a fallback for a
+            # session built without an address.
+            address = self.address or self.core.device_address \
+                or GLASSES_MAC
+            log(f"SCO open: target {address} (session {self.device})")
             for attempt in range(12):
                 if not self.alive or self.call_state != "active":
                     return
@@ -807,10 +820,12 @@ class Session:
                             pass
                         s = None
                     if attempt == 0:
-                        log(f"SCO connect refused ({e}); retrying")
+                        log(f"SCO connect to {address} refused ({e}); "
+                            "retrying")
                     time.sleep(0.25)
             if s is None:
-                log(f"SCO connect failed after retries: {last}")
+                log(f"SCO connect to {address} failed after retries: "
+                    f"{last}")
                 # Don't leave the silent call standing with no audio:
                 # end it so both sides return to a clean idle and the
                 # next start dials fresh instead of hitting the zombie.

@@ -199,3 +199,111 @@ def test_reconnect_closes_superseded_generic_link(ga, monkeypatch):
     prof.NewConnection("/h", Fd(), {})
     prof.NewConnection("/h", Fd(), {})
     assert socks[0].closed and not socks[1].closed
+
+
+# -- audio-open must target the session's OWN device ------------------------
+
+GLASSES_ADDR = "F4:AA:00:00:00:01"
+CORSAIR_ADDR = "00:1B:00:00:00:99"      # sorts BEFORE the glasses
+
+
+class FakeSCO:
+    connects = []
+
+    def __init__(self, *a):
+        pass
+
+    def setsockopt(self, *a):
+        pass
+
+    def settimeout(self, t):
+        pass
+
+    def connect(self, addr):
+        FakeSCO.connects.append(addr)
+
+    def recv(self, n):
+        return b""
+
+    def close(self):
+        pass
+
+
+def _two_records(ga, monkeypatch, order):
+    core = Core()
+    core._live_started_locked = lambda: None
+    reg = hr.DeviceRegistry(hr.FingerprintConfig("", "Meta Glasses"),
+                            log=lambda m: None)
+    prof = ga.Profile(None, "/p", core, reg)
+    infos = {"/g": hr.DeviceInfo(GLASSES_ADDR, name="Meta Glasses 1A",
+                                 paired=True),
+             "/c": hr.DeviceInfo(CORSAIR_ADDR, name="Corsair HS55",
+                                 paired=True)}
+    monkeypatch.setattr(prof, "read_device_info", lambda d: infos[d])
+    monkeypatch.setattr(ga.socket, "fromfd", lambda *a: FakeSock())
+    monkeypatch.setattr(os, "close", lambda fd: None)
+    threads = []
+    monkeypatch.setattr(
+        threading, "Thread",
+        lambda target=None, args=(), **k: types.SimpleNamespace(
+            start=lambda: threads.append((target, args))))
+
+    class Fd:
+        def take(self):
+            return 99
+
+    for d in order:
+        prof.NewConnection(d, Fd(), {})
+    return core, reg, threads
+
+
+@pytest.mark.parametrize("order", [("/c", "/g"), ("/g", "/c")])
+def test_glasses_audio_open_targets_glasses_with_two_records(
+        ga, monkeypatch, order):
+    core, reg, _ = _two_records(ga, monkeypatch, order)
+    assert [r.address for r in reg.records()][0:2] != []
+    assert sorted(r.address for r in reg.records())[0] == CORSAIR_ADDR
+    sess = core.session
+    assert sess.address == GLASSES_ADDR
+    sess.call_state = "active"
+    FakeSCO.connects = []
+    monkeypatch.setattr(ga.socket, "socket", FakeSCO)
+    sess._open_sco_worker()
+    assert FakeSCO.connects == [GLASSES_ADDR]
+
+
+def test_audio_open_ignores_a_contaminated_shared_address(
+        ga, monkeypatch):
+    # Even if the controller-wide scalar were ever wrong, the session's
+    # own address decides the SCO target.
+    core, reg, _ = _two_records(ga, monkeypatch, ("/g", "/c"))
+    core.device_address = CORSAIR_ADDR
+    sess = core.session
+    sess.call_state = "active"
+    FakeSCO.connects = []
+    monkeypatch.setattr(ga.socket, "socket", FakeSCO)
+    sess._open_sco_worker()
+    assert FakeSCO.connects == [GLASSES_ADDR]
+
+
+def test_a2dp_card_follows_the_glasses_session_not_shared_state(
+        ga, monkeypatch):
+    core, _, _ = _two_records(ga, monkeypatch, ("/g", "/c"))
+    agc = ga.AGCore.__new__(ga.AGCore)
+    agc.session = core.session
+    agc.device_address = CORSAIR_ADDR           # wrong on purpose
+    assert agc.CARD == "bluez_card.F4_AA_00_00_00_01"
+    agc.session = None                          # between sessions
+    agc.device_address = GLASSES_ADDR
+    assert agc.CARD == "bluez_card.F4_AA_00_00_00_01"
+
+
+def test_generic_session_never_drives_glasses_audio_state(
+        ga, monkeypatch):
+    core, reg, threads = _two_records(ga, monkeypatch, ("/g", "/c"))
+    h = reg.get(CORSAIR_ADDR).session
+    h.sock = FakeSock()
+    h.handle("AT+BCC")                           # audio-open request
+    assert core.session.address == GLASSES_ADDR
+    assert core.state == "down"                  # glasses untouched
+    assert reg.get(CORSAIR_ADDR).audio_refusals == 1
