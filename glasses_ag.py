@@ -25,6 +25,16 @@ What it does:
   * CVSD is never used: the glasses refuse legacy synchronous-link
     proposals from an initiator (HCI status 0x1f); the parameterized
     eSCO/mSBC setup is accepted instantly.
+  * Discord mode (`glasses-mic discord`): the power-saving mode.
+    The glasses idle in A2DP media mode while the daemon advertises
+    a Playing MPRIS player, so the temple tap's play/pause event is
+    delivered to the daemon instead of starting a paused music app.
+    A tap opens the mic as above; the mic closes itself after ~4 s
+    of silence (RMS meter on the decoded stream) or at a 90 s cap,
+    whichever comes first — a descending chirp sounds before the
+    close, and a tap while open resets the cap. A held HFP call is
+    what drains the glasses, so calls now exist only while the user
+    is actually talking.
 
 Audio path details (all proven on the real hardware, 2026-10-26):
   * SCO packets are 60 bytes: [2-byte header][57-byte mSBC frame]
@@ -37,6 +47,7 @@ Audio path details (all proven on the real hardware, 2026-10-26):
 
 import base64
 import ctypes
+import math
 import os
 import re
 import socket
@@ -45,6 +56,7 @@ import struct
 import sys
 import threading
 import time
+from array import array
 from collections import deque
 from datetime import datetime
 
@@ -69,6 +81,22 @@ except ImportError as e:
 GLASSES_MAC = os.environ.get("GLASSES_AG_ADDRESS", "").strip().upper()
 GLASSES_NAME_PREFIX = os.environ.get(
     "GLASSES_AG_NAME_PREFIX", "Meta Glasses").strip()
+
+# Discord mode (tap-to-talk with power saving; design settled and
+# hardware-verified in pieces 2026-10-28): while armed, the daemon
+# advertises itself as a *Playing* MPRIS player, which makes the
+# desktop's AVRCP bridge route the glasses' temple-tap play/pause
+# events to the daemon instead of to a paused music app. A tap opens
+# the mic; the mic closes itself after DISCORD_HANGOVER seconds of
+# silence, or at the DISCORD_CAP hard limit (a tap while open resets
+# the cap). Thresholds are env-tunable for playtesting.
+DISCORD_CAP = float(os.environ.get("GLASSES_AG_DISCORD_CAP", "90"))
+DISCORD_HANGOVER = float(os.environ.get(
+    "GLASSES_AG_DISCORD_HANGOVER", "4"))
+DISCORD_VAD_RMS = float(os.environ.get(
+    "GLASSES_AG_DISCORD_VAD_RMS", "300"))
+MPRIS_NAME = "org.mpris.MediaPlayer2.glassesag"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
 HF_UUID = "0000111e-0000-1000-8000-00805f9b34fb"
 AG_UUID = "0000111f-0000-1000-8000-00805f9b34fb"
 BLUEZ = "org.bluez"
@@ -359,6 +387,16 @@ class SpkSink:
 # --------------------------------------------------------------------------
 # AG core: shared state the control socket drives.
 
+def _pcm_rms(pcm):
+    """RMS amplitude of s16le PCM — the Discord-mode voice meter."""
+    n = len(pcm) // 2
+    if n == 0:
+        return 0.0
+    a = array("h")
+    a.frombytes(pcm[:n * 2])
+    return math.sqrt(sum(s * s for s in a) / n)
+
+
 class AGCore:
     def __init__(self, pipe, decoder, encoder=None, spk=None):
         self.pipe = pipe
@@ -371,6 +409,15 @@ class AGCore:
         self.lock = threading.Lock()
         self.battery = None         # last +BIEV battery report (0-100)
         self.a2dp_parked = False    # we parked the glasses' A2DP card
+        # Discord mode (tap-to-talk): armed flag, the MPRIS player
+        # object (attached by main()), and the live-session clocks
+        # the auto-close monitor watches.
+        self.discord = False
+        self.mpris = None
+        self.live_since = None
+        self.cap_deadline = None
+        self.last_voice = 0.0
+        self._monitor_started = False
 
     def status(self):
         sess = self.session
@@ -379,6 +426,10 @@ class AGCore:
              f"call={sess.call_state if sess else 'none'}")
         if self.battery is not None:
             s += f" battery={self.battery}"
+        s += f" discord={'on' if self.discord else 'off'}"
+        if (self.discord and self.state == "live"
+                and self.cap_deadline is not None):
+            s += f" cap_in={max(0, int(self.cap_deadline - time.monotonic()))}s"
         return s
 
     def cmd_start(self):
@@ -411,6 +462,8 @@ class AGCore:
             was = self.state
             if self.state in ("live", "starting"):
                 self.state = "ready"
+                self.live_since = None
+                self.cap_deadline = None
         if sess and was in ("live", "starting"):
             sess.stop_dictation()
             # Covers a stop issued mid-start (A2DP still parked, the
@@ -425,6 +478,113 @@ class AGCore:
         if self.state == "live":
             return self.cmd_stop()
         return self.cmd_start()
+
+    # -- Discord mode (tap-to-talk, power-saving) --------------------------
+    # The glasses idle in A2DP media mode (cheap). While armed, the
+    # daemon's MPRIS player advertises "Playing", so the temple tap's
+    # AVRCP play/pause lands HERE (proven with a stub player
+    # 2026-10-28) instead of starting a paused music app. Tap opens
+    # the mic; the monitor below closes it on silence or at the cap.
+
+    def set_discord(self, on):
+        with self.lock:
+            was = self.discord
+            self.discord = on
+        if on and not was:
+            if not self._monitor_started:
+                self._monitor_started = True
+                threading.Thread(target=self._discord_monitor,
+                                 daemon=True,
+                                 name="discord-monitor").start()
+            if self.mpris is not None:
+                self.mpris.arm()
+            log("discord mode ARMED — tap opens the mic")
+        elif was and not on:
+            if self.mpris is not None:
+                self.mpris.disarm()
+            if self.state in ("live", "starting"):
+                self.cmd_stop()
+            log("discord mode disarmed")
+        return "ok: discord " + ("on" if on else "off")
+
+    def cmd_discord(self, arg="toggle"):
+        if arg == "on":
+            return self.set_discord(True)
+        if arg == "off":
+            return self.set_discord(False)
+        return self.set_discord(not self.discord)
+
+    def _live_started_locked(self):
+        # Called with self.lock held wherever state becomes "live".
+        now = time.monotonic()
+        self.live_since = now
+        if self.discord:
+            self.cap_deadline = now + DISCORD_CAP
+            # The tap itself counts as activity: the user gets the
+            # full hangover window to start speaking before the
+            # silence rule can close the mic.
+            self.last_voice = now
+
+    def note_audio(self, pcm):
+        # Voice meter on the decoded mic stream (SCO reader thread).
+        if not self.discord:
+            return
+        if _pcm_rms(pcm) >= DISCORD_VAD_RMS:
+            self.last_voice = time.monotonic()
+
+    def on_tap(self):
+        """The temple tap arrived (MPRIS Play/Pause/PlayPause)."""
+        if not self.discord:
+            return
+        if self.state == "ready":
+            log("discord: tap — opening mic")
+            threading.Thread(target=self._tap_open,
+                             daemon=True).start()
+        elif self.state in ("starting", "live"):
+            with self.lock:
+                self.cap_deadline = (time.monotonic()
+                                     + DISCORD_CAP)
+            log("discord: tap — safety cap extended")
+            sess = self.session
+            if self.state == "live" and sess is not None:
+                threading.Thread(
+                    target=sess.play_cue_freqs, args=((740,),),
+                    kwargs={"blip": 0.12, "gap": 0.0},
+                    daemon=True).start()
+
+    def _tap_open(self):
+        log(f"discord: tap open -> {self.cmd_start()}")
+
+    def _discord_monitor(self):
+        while True:
+            time.sleep(0.25)
+            try:
+                self._discord_tick()
+            except Exception as e:      # never let the monitor die
+                log(f"discord monitor error: {e}")
+
+    def _discord_tick(self):
+        if not self.discord:
+            return
+        with self.lock:
+            if self.state != "live":
+                return
+            cap = self.cap_deadline
+            last_voice = self.last_voice
+        now = time.monotonic()
+        if cap is not None and now >= cap:
+            self._discord_close("safety cap reached")
+        elif now - last_voice >= DISCORD_HANGOVER:
+            self._discord_close("silence")
+
+    def _discord_close(self, reason):
+        log(f"discord: closing mic ({reason})")
+        sess = self.session
+        if sess is not None:
+            # Descending chirp first, while the link is still open —
+            # the user hears the close coming, never a silent drop.
+            sess.play_cue_freqs((880, 587))
+        self.cmd_stop()
 
     # -- A2DP choreography --------------------------------------------------
     # The glasses refuse to OPEN an eSCO voice link while an A2DP media
@@ -532,6 +692,7 @@ class Session:
         self.sco_sock = None
         self.sco_opening = False
         self.sco_lock = threading.Lock()   # cue vs downlink sends
+        self.cue_hold = threading.Event()  # downlink pauses for cues
         self.parser = SCOParser(core.decoder)
 
     # -- RFCOMM plumbing --------------------------------------------------
@@ -611,6 +772,7 @@ class Session:
         self.sco_sock = s
         with self.core.lock:
             self.core.state = "live"
+            self.core._live_started_locked()
         log("SCO open — microphone live")
         # NOTE: A2DP deliberately stays parked for the call's
         # duration. Resuming it alongside the voice link worked, but
@@ -637,6 +799,51 @@ class Session:
         except OSError:
             pass
 
+    def play_cue_freqs(self, freqs, blip=0.19, gap=0.055):
+        """Play a short generated tone cue into the glasses over the
+        live downlink: one sine blip per frequency, mSBC-encoded and
+        framed exactly like the downlink stream. Used for the
+        Discord-mode extend blip (single freq) and the descending
+        close chirp (880 -> 587). The downlink thread holds while a
+        cue plays, so cue frames never interleave with app audio."""
+        s = self.sco_sock
+        enc = self.core.encoder
+        if s is None or enc is None:
+            return
+        units = []
+        idx = 0
+
+        def wrap(frame):
+            nonlocal idx
+            if len(frame) == 57:
+                units.append(bytes((0x01, self.HEADER_B[idx % 4]))
+                             + frame + b"\x00")
+                idx += 1
+
+        for freq in freqs:
+            samples = array("h", (
+                int(20000 * math.sin(2 * math.pi * freq * i / 16000))
+                for i in range(int(blip * 16000))))
+            for off in range(0, len(samples) - 119, 120):
+                wrap(enc.encode_frame(
+                    samples[off:off + 120].tobytes()))
+            gap_frame = enc.encode_frame(b"\x00" * 240)
+            for _ in range(int(gap / 0.0075)):
+                wrap(gap_frame)
+        self.cue_hold.set()
+        try:
+            for unit in units:
+                if self.sco_sock is not s:
+                    return
+                with self.sco_lock:
+                    try:
+                        s.sendall(unit)
+                    except OSError:
+                        return
+                time.sleep(0.0075)
+        finally:
+            self.cue_hold.clear()
+
     # Downlink framing, measured from the glasses' own uplink
     # (2026-10-26 capture): header [0x01, B] with B cycling
     # C8 -> F8 -> 08 -> 38, then the 57-byte frame, then 0x00.
@@ -657,6 +864,12 @@ class Session:
         idx = 0
         next_t = time.monotonic()
         while self.sco_sock is s and self.alive:
+            if self.cue_hold.is_set():
+                # A cue owns the wire; resume on a fresh clock so we
+                # never burst to "catch up" afterwards.
+                time.sleep(0.01)
+                next_t = time.monotonic()
+                continue
             frame = enc.encode_frame(spk.take())
             if len(frame) == 57:
                 unit = (bytes((0x01, self.HEADER_B[idx % 4]))
@@ -684,6 +897,7 @@ class Session:
                     break
                 pcm = self.parser.feed(data)
                 if pcm:
+                    self.core.note_audio(pcm)
                     self.core.pipe.push(pcm)
         except OSError:
             pass
@@ -696,6 +910,8 @@ class Session:
             with self.core.lock:
                 if self.core.state == "live":
                     self.core.state = "ready"
+                    self.core.live_since = None
+                    self.core.cap_deadline = None
 
     def close_sco(self):
         if self.sco_sock is not None:
@@ -924,7 +1140,158 @@ class Session:
                 if self.core.session is self:
                     self.core.session = None
                     self.core.state = "down"
+                    self.core.live_since = None
+                    self.core.cap_deadline = None
             log("session end")
+
+
+# --------------------------------------------------------------------------
+# MPRIS player: the tap swallower for Discord mode. While armed, this
+# object owns org.mpris.MediaPlayer2.glassesag on the SESSION bus and
+# advertises PlaybackStatus "Playing". The desktop's AVRCP bridge
+# routes the glasses' temple-tap play/pause to a Playing player in
+# preference to paused ones (proven 2026-10-28 with a stub player:
+# the stub took every tap, paused Spotify never moved), so the taps
+# land here as Play/Pause/PlayPause calls -> core.on_tap(). The name
+# is only owned while armed; disarming releases it, and taps go back
+# to behaving like ordinary media keys.
+
+class MPRISPlayer(dbus.service.Object):
+    ROOT = "org.mpris.MediaPlayer2"
+    PLAYER = "org.mpris.MediaPlayer2.Player"
+    PROPS = "org.freedesktop.DBus.Properties"
+
+    def __init__(self, core):
+        self.core = core
+        self._name = None           # BusName while armed
+        self.armed = False
+
+    def arm(self):
+        if self.armed:
+            return
+        try:
+            bus = dbus.SessionBus()
+            dbus.service.Object.__init__(self, bus, MPRIS_PATH)
+            self._name = dbus.service.BusName(MPRIS_NAME, bus,
+                                              do_not_queue=True)
+        except dbus.DBusException as e:
+            log(f"discord: MPRIS registration failed: "
+                f"{e.get_dbus_name()}")
+            return
+        self.armed = True
+        log("discord: MPRIS player live (advertising Playing)")
+
+    def disarm(self):
+        if not self.armed:
+            return
+        try:
+            self.remove_from_connection()
+        except Exception:
+            pass
+        self._name = None           # dropping the BusName releases it
+        self.armed = False
+        log("discord: MPRIS player released")
+
+    # -- property plumbing ----------------------------------------------
+    def _root_props(self):
+        return {
+            "CanQuit": dbus.Boolean(False),
+            "CanRaise": dbus.Boolean(False),
+            "HasTrackList": dbus.Boolean(False),
+            "Identity": dbus.String("glasses-ag (Discord mode)"),
+            "SupportedUriSchemes": dbus.Array([], signature="s"),
+            "SupportedMimeTypes": dbus.Array([], signature="s"),
+        }
+
+    def _player_props(self):
+        return {
+            "PlaybackStatus": dbus.String(
+                "Playing" if self.armed else "Stopped"),
+            "LoopStatus": dbus.String("None"),
+            "Rate": dbus.Double(1.0),
+            "Shuffle": dbus.Boolean(False),
+            "Metadata": dbus.Dictionary({}, signature="sv"),
+            "Volume": dbus.Double(1.0),
+            "Position": dbus.Int64(0),
+            "MinimumRate": dbus.Double(1.0),
+            "MaximumRate": dbus.Double(1.0),
+            "CanGoNext": dbus.Boolean(False),
+            "CanGoPrevious": dbus.Boolean(False),
+            "CanPlay": dbus.Boolean(True),
+            "CanPause": dbus.Boolean(True),
+            "CanSeek": dbus.Boolean(False),
+            "CanControl": dbus.Boolean(True),
+        }
+
+    @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
+    def Get(self, interface, prop):
+        props = (self._player_props() if interface == self.PLAYER
+                 else self._root_props())
+        if prop in props:
+            return props[prop]
+        raise dbus.exceptions.DBusException(
+            f"unknown property {prop}",
+            name="org.freedesktop.DBus.Error.UnknownProperty")
+
+    @dbus.service.method(PROPS, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface == self.PLAYER:
+            return self._player_props()
+        if interface == self.ROOT:
+            return self._root_props()
+        return {}
+
+    @dbus.service.signal(PROPS, signature="sa{sv}as")
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
+
+    # -- root interface ---------------------------------------------------
+    @dbus.service.method(ROOT, in_signature="", out_signature="")
+    def Raise(self):
+        pass
+
+    @dbus.service.method(ROOT, in_signature="", out_signature="")
+    def Quit(self):
+        pass
+
+    # -- player interface: the tap lands here ------------------------------
+    @dbus.service.method(PLAYER, in_signature="", out_signature="")
+    def Play(self):
+        self.core.on_tap()
+
+    @dbus.service.method(PLAYER, in_signature="", out_signature="")
+    def Pause(self):
+        self.core.on_tap()
+
+    @dbus.service.method(PLAYER, in_signature="", out_signature="")
+    def PlayPause(self):
+        self.core.on_tap()
+
+    @dbus.service.method(PLAYER, in_signature="", out_signature="")
+    def Stop(self):
+        if self.core.state == "live":
+            log("discord: MPRIS Stop — closing mic")
+            self.core.cmd_stop()
+
+    @dbus.service.method(PLAYER, in_signature="", out_signature="")
+    def Next(self):
+        pass
+
+    @dbus.service.method(PLAYER, in_signature="", out_signature="")
+    def Previous(self):
+        pass
+
+    @dbus.service.method(PLAYER, in_signature="x", out_signature="")
+    def Seek(self, offset):
+        pass
+
+    @dbus.service.method(PLAYER, in_signature="ox", out_signature="")
+    def SetPosition(self, track, position):
+        pass
+
+    @dbus.service.method(PLAYER, in_signature="s", out_signature="")
+    def OpenUri(self, uri):
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -1017,7 +1384,8 @@ def unregister(bus, path):
 
 
 # --------------------------------------------------------------------------
-# Control socket: line protocol — start | stop | toggle | status.
+# Control socket: line protocol — start | stop | toggle | media |
+# discord [on|off] | status.
 
 def control_server(core):
     os.makedirs(RUNTIME_DIR, exist_ok=True)
@@ -1049,6 +1417,12 @@ def control_server(core):
                 reply = core.cmd_toggle()
             elif cmd == "media":
                 reply = core.cmd_media()
+            elif cmd == "discord":
+                reply = core.cmd_discord("toggle")
+            elif cmd == "discord_on":
+                reply = core.cmd_discord("on")
+            elif cmd == "discord_off":
+                reply = core.cmd_discord("off")
             elif cmd == "status":
                 reply = "ok: " + core.status()
             else:
@@ -1074,6 +1448,7 @@ def main():
     spk = SpkSink(SPK_FIFO_PATH)
     spk.start()
     core = AGCore(pipe, decoder, encoder, spk)
+    core.mpris = MPRISPlayer(core)
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()

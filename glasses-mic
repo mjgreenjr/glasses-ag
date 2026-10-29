@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """glasses-mic — control the glasses-ag daemon.
 
-Usage: glasses-mic start | stop | toggle | status | media
+Usage: glasses-mic start | stop | toggle | status | media |
+       discord | discord_on | discord_off
 (media = end any call session and put the glasses back in speaker
-mode, restoring A2DP even if another process parked it.)
+mode, restoring A2DP even if another process parked it.
+discord = toggle Discord mode: tap-to-talk with power saving —
+glasses-mic discord_on arms it, discord_off disarms; while armed a
+temple tap opens the mic and it closes itself on silence.)
 Talks to the daemon's control socket in $XDG_RUNTIME_DIR/glasses-ag/.
 Exit status is 0 on an "ok:" reply, 1 on "err:" or no daemon.
 """
@@ -19,7 +23,8 @@ CTL_PATH = os.path.join(
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in (
-            "start", "stop", "toggle", "status", "media"):
+            "start", "stop", "toggle", "status", "media",
+            "discord", "discord_on", "discord_off"):
         print(__doc__.strip())
         return 2
     try:

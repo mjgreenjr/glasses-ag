@@ -67,6 +67,11 @@ def main():
                   "ready": "Microphone: ready",
                   "starting": "Microphone: starting…"}.get(
                       state, f"State: {state}"))
+    if kv.get("discord") == "on":
+        dline = "Discord mode: armed — tap temple to talk"
+        if state == "live" and kv.get("cap_in"):
+            dline += f" (auto-close cap: {kv['cap_in']})"
+        lines.append(dline)
     if call not in ("idle", "none", "?"):
         lines.append(f"Call: {call}")
     m = re.search(r"Name: " + re.escape(card) +

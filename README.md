@@ -78,6 +78,55 @@ glasses-mic toggle
 glasses-mic media     # force the glasses back to media/A2DP mode
 ```
 
+## Discord mode (tap-to-talk, power saving)
+
+Holding an HFP call open is what drains the glasses — a headset-mode
+session flattens their battery in a few hours. Discord mode exists so
+a call session only exists while you are actually talking:
+
+```sh
+glasses-mic discord_on    # arm it (glasses-mic discord toggles)
+glasses-mic discord_off   # disarm
+```
+
+While armed, the glasses idle in ordinary A2DP media mode and the
+daemon advertises itself as a media player (MPRIS, status
+*Playing*), which makes the desktop deliver the glasses' temple-tap
+play/pause events to the daemon instead of to a paused music app.
+Then:
+
+- **Tap once** — the microphone session opens (you hear the usual
+  two-blip connect cue). The tap never starts or pauses your music.
+- **Speak, then stop** — after about 4 seconds of silence the
+  session closes by itself. A descending chirp sounds just before
+  it drops, so the close is never a surprise.
+- **Tap while open** — extends the safety cap (a short blip confirms)
+  if you need the mic held open without speaking.
+- Sessions close automatically at a **90-second safety cap** no
+  matter what, so a forgotten open mic can't drain the glasses.
+
+Suggested Discord wiring: **Input = Meta Glasses Mic** (it's silent
+while the glasses are in media mode). For **Output**, pick *Meta
+Glasses Call Audio* if you want to hear people during your own
+talking bursts, or the glasses' A2DP device if you mostly listen and
+only tap to interject (you won't hear others during your own burst —
+A2DP is parked while you talk, as with a phone call).
+
+One interaction to know about: if another app is *actively playing*
+to any device when you tap, the desktop hands taps to playing
+players in the order they started playing — the first tap may pause
+that playback before a later tap reaches the daemon. Paused players
+never steal the tap while Discord mode is armed.
+
+Thresholds can be tuned in the service file and the daemon restarted,
+e.g. `Environment=GLASSES_AG_DISCORD_CAP=120`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GLASSES_AG_DISCORD_CAP` | `90` | hard session limit, seconds |
+| `GLASSES_AG_DISCORD_HANGOVER` | `4` | seconds of silence before auto-close |
+| `GLASSES_AG_DISCORD_VAD_RMS` | `300` | mic level (RMS) that counts as voice |
+
 Hyprland keybind example:
 
 ```ini
