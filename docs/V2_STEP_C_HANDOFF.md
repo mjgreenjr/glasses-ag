@@ -346,3 +346,30 @@ local pass.
    session; "observed on" wording; the daemon is a bystander.
 
 Nothing else was touched.
+
+---
+
+# Addendum 2 — AT+XAPL accepted (KH156M, 41:42:00:00:0C:45)
+
+`GenericSession` now accepts `AT+XAPL=<vendor>-<product>-<version>,<features>`
+(`hfp_generic.py`). The identifier and feature bits are stored
+(`xapl_id`, `xapl_features`; shown as `xapl=…` on `status <device>`) and
+the dialect acceptance is logged. Evidence: the KH156M's
+`XAPL (000D-0001-0101,2)` got ERROR and it then never sent
+`AT+IPHONEACCEV`, so no battery; strict devices gate battery on XAPL
+acceptance (the Corsair ignores the rejection and reports anyway).
+
+Reply is the standard `+XAPL=iPhone,<bits>` line then OK, where `<bits>`
+advertises only what we consume (battery bit 1, and only if the device
+offered it; so `…,2` → `+XAPL=iPhone,2`). This goes slightly beyond a bare
+OK; if a device dislikes the extra line, a bare OK is the one-line change in
+`_on_xapl`. Malformed XAPL (no comma, non-numeric features) still gets
+ERROR. Devices that never send it are unaffected; not a quirk-table gate.
+
+Tests (stub only): accepted/parsed/stored, feature-bit intersection,
+malformed → ERROR, XAPL-then-IPHONEACCEV battery path, non-senders
+unaffected; the Step B "XAPL → ERROR" assertion was removed. Suite: all
+green. **Re-check on hardware:** KH156M reconnects → `XAPL dialect
+accepted: id=000D-0001-0101 features=2`, then (hopefully)
+`AT+IPHONEACCEV` and `hf_battery=` on its device line. If it still sends
+no IPHONEACCEV, paste the HF<</HF>> lines around the XAPL exchange.

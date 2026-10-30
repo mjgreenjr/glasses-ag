@@ -325,7 +325,7 @@ def test_bcc_is_refused_cleanly_with_logged_reason():
 def test_unknown_at_gets_clean_error_and_link_survives():
     sess, sock, _, _ = make()
     connect_full(sess, sock)
-    for cmd in ("AT+XYZZY=1", "AT+XAPL=ab-cd,2",
+    for cmd in ("AT+XYZZY=1",
                 "AT+NREC=0", "AT+CMEE=1", "ATZ", "garbage", "AT+"):
         assert replies(say(sess, sock, cmd)) == ["ERROR"], cmd
     assert sess.alive and sess.slc
@@ -441,3 +441,49 @@ def test_bia_records_state_and_tolerates_extra_fields():
     # unrelated tokens in an otherwise valid list don't undo the rest
     assert replies(say(sess, sock, "AT+BIA=1,z,0")) == ["OK"]
     assert sess.ind_enabled[2] is False and sess.ind_enabled[1] is False
+
+
+# -- Apple XAPL handshake (strict devices gate battery on it) --------------
+
+def test_xapl_is_accepted_parsed_and_stored():
+    sess, sock, _, logs = make()
+    connect_full(sess, sock)
+    out = replies(say(sess, sock, "AT+XAPL=000D-0001-0101,2"))
+    assert out == ["+XAPL=iPhone,2", "OK"]
+    assert sess.xapl_id == "000D-0001-0101" and sess.xapl_features == 2
+    assert any("XAPL dialect accepted" in l for l in logs)
+    assert "xapl=000D-0001-0101,2" in sess.detail_fields()
+    assert sess.alive and sess.slc
+
+
+def test_xapl_advertises_only_what_we_consume():
+    sess, sock, _, _ = make()
+    assert replies(say(sess, sock, "AT+XAPL=0001-0002-0003,6"))[0] \
+        == "+XAPL=iPhone,2"                        # battery, not dock
+    assert replies(say(sess, sock, "AT+XAPL=0001-0002-0003,4"))[0] \
+        == "+XAPL=iPhone,0"                        # no battery offered
+    assert sess.xapl_features == 4
+
+
+@pytest.mark.parametrize("arg", ["", "abc", "0001-0002-0003",
+                                 "0001-0002-0003,x", ",2"])
+def test_xapl_malformed_is_a_clean_error(arg):
+    sess, sock, _, _ = make()
+    assert replies(say(sess, sock, f"AT+XAPL={arg}")) == ["ERROR"]
+    assert sess.xapl_id is None and sess.alive
+
+
+def test_strict_device_xapl_then_iphoneaccev_reports_battery():
+    sess, sock, _, _ = make()
+    connect_full(sess, sock)
+    assert replies(say(sess, sock, "AT+XAPL=000D-0001-0101,2"))[-1] == "OK"
+    assert replies(say(sess, sock, "AT+IPHONEACCEV=1,1,7")) == ["OK"]
+    assert sess.hf_battery == 70
+    assert "hf_battery=70" in sess.status_fields()
+
+
+def test_devices_that_never_send_xapl_are_unaffected():
+    sess, sock, _, _ = make()
+    connect_full(sess, sock)
+    assert sess.xapl_id is None
+    assert "xapl=" not in sess.detail_fields()

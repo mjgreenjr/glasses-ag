@@ -111,6 +111,8 @@ class GenericSession:
         self.hf_safety = None
         self.speaker_gain = None
         self.mic_gain = None
+        self.xapl_id = None             # vendor-product-version string
+        self.xapl_features = None       # Apple accessory feature bits
         self.clip = False
         self.ccwa = False
         # codec connection state
@@ -221,6 +223,8 @@ class GenericSession:
             parts.append(f"vgs={self.speaker_gain}")
         if self.mic_gain is not None:
             parts.append(f"vgm={self.mic_gain}")
+        if self.xapl_id is not None:
+            parts.append(f"xapl={self.xapl_id},{self.xapl_features}")
         if self.audio is not None:
             parts.append(self.audio.detail_fields())
         return " ".join(parts)
@@ -483,16 +487,48 @@ class GenericSession:
             self.send("\r\n+COPS: 0\r\n" + OK)
         elif u == "AT+CNUM":
             self.send(OK)           # no subscriber numbers
+        elif u.startswith("AT+XAPL="):
+            self._on_xapl(u[8:])
         elif u.startswith("AT+IPHONEACCEV="):
             self._on_iphoneaccev(u[15:])
         elif u == "AT":
             self.send(OK)
         else:
             # Everything else — ATA/ATD/AT+CHUP with no call, NREC,
-            # CMEE, BTRH, BSIR, other vendor extensions (XAPL, …) —
+            # CMEE, BTRH, BSIR, other vendor extensions —
             # is unsupported here: clean ERROR, link stays up.
             self.log(f"[{self.address}] unsupported command {cmd!r}")
             self.send(ERROR)
+
+    # Apple accessory feature bits (AT+XAPL): bit 1 battery reports,
+    # bit 2 docked/undocked. Only battery is consumed here.
+    XAPL_BATTERY = 1 << 1
+
+    def _on_xapl(self, arg):
+        """AT+XAPL=<vendor>-<product>-<version>,<features>. Accepted as
+        a DIALECT (not a quirk-table gate): strict devices gate their
+        battery reports (AT+IPHONEACCEV) on this being accepted, and a
+        rejection makes them stay silent. The identifier and feature
+        bits are stored; the reply is the standard `+XAPL=iPhone,<bits>`
+        advertising only what we consume (battery, if they offered it),
+        then OK. Devices that never send it are unaffected."""
+        ident, sep, feats = arg.partition(",")
+        ident = ident.strip()
+        try:
+            features = int(feats)
+        except ValueError:
+            features = None
+        if not ident or not sep or features is None or features < 0:
+            self.log(f"[{self.address}] malformed XAPL {arg!r}")
+            self.send(ERROR)
+            return
+        self.xapl_id = ident
+        self.xapl_features = features
+        ours = features & self.XAPL_BATTERY
+        self.log(f"[{self.address}] XAPL dialect accepted: id={ident} "
+                 f"features={features} (battery reports "
+                 f"{'on' if ours else 'not offered'})")
+        self.send(f"\r\n+XAPL=iPhone,{ours}\r\n" + OK)
 
     def _on_iphoneaccev(self, arg):
         """Apple accessory battery dialect: <count>,<key>,<val>,...
