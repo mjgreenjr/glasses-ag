@@ -217,16 +217,17 @@ glasses are not in a call, other headsets get full service.
 
 ### Headset reconnect notes
 
-Observed on a Corsair HS55, and on one Sennheiser pairing variant:
-after a **host-side reconnect** (reconnecting from the computer's
-Bluetooth manager rather than from the headset) the headset may come
-back **A2DP-only** — it simply does not open its Hands-Free (HFP)
-connection, so no `… Mic` source appears and `glasses-mic status`
-shows no device line for it. **Power-cycling the headset restores the
-HFP session.** This is the headset being lazy about HFP, not the
-daemon: glasses-ag only answers the connection when the headset opens
-it, and it is a bystander here. Audio playback (A2DP) is unaffected
-either way.
+Observed on a Corsair HS55 (including right after a **fresh
+pairing**), and on one Sennheiser pairing variant: a **host-initiated
+connect** — reconnecting from the computer's Bluetooth manager, or
+connecting right after pairing — can land **A2DP-only**. The headset
+simply does not open its Hands-Free (HFP) connection, so there is no
+daemon session for it: no `… Mic` source appears and `glasses-mic
+status` shows no device line for it. **Power-cycling the headset**
+(its own device-initiated auto-reconnect) engages the HFP session.
+This is the headset being lazy about HFP, not the daemon: glasses-ag
+only answers a connection the headset opens, and is a bystander here.
+Audio playback (A2DP) is unaffected either way.
 
 ## Device selection and configuration
 
@@ -267,6 +268,13 @@ environment variables.
 - Call audio is one call at a time across all devices, and a second
   connected device can block the glasses' call audio on some adapters
   (see *Known limitation*).
+- Observed on a Realtek adapter: a **KH156M** budget headset blocks
+  the glasses' call audio by mere connected presence — its session up,
+  no call in progress, in either connection order, the glasses' SCO is
+  refused (`Errno 111`). It has to be **disconnected** for glasses
+  calls; stopping its audio is not enough. The Corsair's idle presence
+  does not do this (see *Known limitation* for the state-dependent
+  behavior seen with other headsets).
 - The daemon logs its local AT-command transcript to the systemd
   journal. Those logs stay on the computer, but review them before
   attaching them to a public bug report; they can contain device

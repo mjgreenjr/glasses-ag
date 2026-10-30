@@ -969,3 +969,52 @@ def test_reason_naming_nobody_stays_current(tmp_path):
     slc(e)
     say(e.sess, e.sock, "AT+BCC")
     assert "audio_reason=\"audio provisioning failed" in _line(e, ADDR)
+
+
+def test_successful_glasses_open_clears_the_refusal_but_not_the_counter(
+        monkeypatch):
+    ga = _install_fakes(monkeypatch)
+    core, reg, _ = _two_records(ga, monkeypatch, ("/g", "/c"))
+    mgr = ha.AudioManager(ha.AudioDeps("/nonexistent", log=lambda m: None),
+                          reg)
+    mgr.bind_glasses(core)
+    sess = core.session
+    sess.call_state = "active"
+    # refused while the Corsair held the call...
+    reg.note_audio_refusal(GLASSES_ADDR, "call audio busy: Corsair HS55",
+                           peers=(CORSAIR_ADDR,), kind="busy")
+    line = [l for l in reg.status_sections() if GLASSES_ADDR in l][0]
+    assert "audio_refusals=1" in line and "last_refusal=" in line
+    # ...the holder stopped, and now a tap opens audio successfully.
+
+    class OkSCO:
+        def __init__(self, *a): pass
+        def setsockopt(self, *a): pass
+        def settimeout(self, t): pass
+        def connect(self, addr): pass
+        def recv(self, n): return b""
+        def close(self): pass
+
+    monkeypatch.setattr(ga.socket, "socket", OkSCO)
+    monkeypatch.setattr(ga.threading, "Thread",
+                        lambda **k: types.SimpleNamespace(
+                            start=lambda: None))
+    sess._open_sco_worker()
+    assert core.state == "live"
+    line = [l for l in reg.status_sections() if GLASSES_ADDR in l][0]
+    assert "audio_reason" not in line and "last_refusal" not in line
+    assert "audio_refusals=1" in line               # cumulative, kept
+
+
+def test_successful_generic_open_clears_its_stale_refusal(tmp_path):
+    e = make_env(tmp_path, pw="missing")
+    slc(e)
+    say(e.sess, e.sock, "AT+BCC")                   # refused (provisioning)
+    assert "audio_refusals=1" in _line(e, ADDR)
+    e.deps.spawn_pwcli = lambda argv, tag="": FakeProc(argv, e.pactl)
+    e.clock[0] += ha.REPROVISION_AFTER_S + 1
+    say(e.sess, e.sock, "AT+BCC")                   # triggers retry
+    open_call(e)
+    line = _line(e, ADDR)
+    assert "audio=live" in line and "audio_refusals=2" in line
+    assert "audio_reason" not in line and "last_refusal" not in line

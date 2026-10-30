@@ -303,6 +303,10 @@ class CallArbiter:
                     "(one call at a time)")
         return None
 
+    def note_success(self, address):
+        if self.registry is not None and address:
+            self.registry.note_audio_success(address)
+
     def note_refusal(self, address, reason):
         """Record a "call audio busy" refusal naming the holder(s)."""
         if self.registry is not None and address:
@@ -903,6 +907,7 @@ class GenericAudio:
                  f"({'mSBC' if codec == CODEC_MSBC else 'CVSD'}, "
                  f"trigger: {self.trigger})")
         bridge.start()
+        self.mgr.arbiter.note_success(self.address)
 
     def _bridge_closed(self, bridge):
         with self.lock:

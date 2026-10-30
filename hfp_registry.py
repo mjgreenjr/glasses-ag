@@ -269,6 +269,18 @@ class DeviceRegistry:
         with self.lock:
             return list(self._records.values())
 
+    def note_audio_success(self, address):
+        """A call-audio link opened for this device: whatever it was
+        last refused for is history. Clears the reason/last_refusal;
+        the cumulative audio_refusals counter is deliberately kept."""
+        with self.lock:
+            rec = self._records.get(address)
+            if rec is None:
+                return
+            rec.last_audio_reason = ""
+            rec.last_audio_peers = ()
+            rec.last_audio_kind = ""
+
     def audio_reason_current(self, rec):
         """True while the last refusal's cause still holds: a "busy"
         reason while a device it names still holds the call; an "sco"
@@ -316,10 +328,12 @@ class DeviceRegistry:
         if rec.audio_refusals:
             line += f" audio_refusals={rec.audio_refusals}"
             # audio_reason only while its cause still holds; afterwards
-            # the same text is shown as history, labelled as such.
-            key = ("audio_reason" if self.audio_reason_current(rec)
-                   else "last_refusal")
-            line += f" {key}=\"{rec.last_audio_reason}\""
+            # the same text is shown as history, labelled as such, until
+            # a successful audio open clears it.
+            if rec.last_audio_reason:
+                key = ("audio_reason" if self.audio_reason_current(rec)
+                       else "last_refusal")
+                line += f" {key}=\"{rec.last_audio_reason}\""
         return line
 
     def status_sections(self):

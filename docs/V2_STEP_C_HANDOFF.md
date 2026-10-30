@@ -373,3 +373,27 @@ green. **Re-check on hardware:** KH156M reconnects → `XAPL dialect
 accepted: id=000D-0001-0101 features=2`, then (hopefully)
 `AT+IPHONEACCEV` and `hf_battery=` on its device line. If it still sends
 no IPHONEACCEV, paste the HF<</HF>> lines around the XAPL exchange.
+
+---
+
+# Addendum 3 — refusal cleared on success; README observations
+
+1. **A successful audio open clears the stale refusal** (`hfp_registry.py`
+   `note_audio_success`, called from `Session._open_sco_worker` via the
+   arbiter for the glasses — one added call after "SCO open — microphone
+   live" — and from `GenericAudio._open_sco` for generic devices). After it,
+   the device line shows neither `audio_reason` nor `last_refusal`;
+   `audio_refusals` stays cumulative, never reset. Tests: glasses
+   refuse → holder gone → successful open (status clean, counter 1), and the
+   generic equivalent (counter 2 after a retry, status clean).
+2. **README, Headset reconnect notes** widened: host-initiated connects,
+   including right after a fresh pairing, can land A2DP-only with no daemon
+   session; a power-cycle (device-initiated auto-reconnect) engages HFP.
+   "Observed with the Corsair HS55 after a fresh pairing."
+3. **README, limitations:** new "observed on a Realtek adapter" bullet — a
+   KH156M blocks the glasses' call audio by connected presence alone
+   (session up, no call, either order, Errno 111); it must be disconnected,
+   not just stopped; the Corsair's idle presence does not. Docs only; the
+   code's diagnostic (`explain_sco_failure`) already fires for it.
+
+Suite: 134 passed (stub only).

@@ -630,6 +630,9 @@ class Session:
             self.core.state = "live"
             self.core._live_started_locked()
         log("SCO open — microphone live")
+        arb = getattr(self.core, "arbiter", None)
+        if arb is not None:     # a good open retires any stale refusal
+            arb.note_success(self.address)
         # NOTE: A2DP deliberately stays parked for the call's
         # duration. Resuming it alongside the voice link worked, but
         # produced repeating double-beeps in the glasses within
