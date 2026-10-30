@@ -1,5 +1,10 @@
 # v2 Step C handoff — dynamic audio provisioning for generic devices
 
+> **STATUS (closing record): hardware-verified locally by Mike.** The
+> "not hardware-verified" statements below are the original, as-written
+> cloud-session caveats and are kept for history; see the closing record at
+> the end of this file for what was verified.
+
 Branch `v2-generic-hfp`, on top of the Step B fix. **Nothing here is
 hardware-verified.** I had no Bluetooth, PipeWire, `pw-cli` or `pactl`;
 everything is stub-tested at a fake boundary (pactl, pw-cli, SCO socket,
@@ -397,3 +402,24 @@ no IPHONEACCEV, paste the HF<</HF>> lines around the XAPL exchange.
    code's diagnostic (`explain_sco_failure`) already fires for it.
 
 Suite: 134 passed (stub only).
+
+---
+
+# Closing record — hardware verification (reported by Mike)
+
+All items on this branch are now hardware-verified locally:
+
+- **Step C round:** passed in full — glasses regression, generic two-way
+  audio on two headsets, arbiter in both directions, A2DP park/restore,
+  clean teardown, daemon-kill recovery.
+- **Fixes batch (Addendum 1):** F1 (demote-on-condition-end) verified; F3
+  (`AT+BIA` leniency) observed working on the KH156M; F2/F4 are README text
+  as written.
+- **XAPL acceptance (Addendum 2):** verified — the KH156M reports
+  `hf_battery` after acceptance.
+- **Clearing batch (Addendum 3):** verified — refusal → stop → successful
+  open leaves only the cumulative `audio_refusals` counter; README items as
+  written.
+
+The branch's work is complete. Verification results are as reported to me;
+I did not run any hardware myself.
