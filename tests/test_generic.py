@@ -145,10 +145,12 @@ def test_cmer_off_disables_ciev_and_bia_masks_indicators():
     assert "+CIEV: 3,2" in sock.sent[start:].decode()
 
 
-def test_bia_bad_input_is_error_and_leaves_mask():
+def test_bia_bad_input_is_acknowledged_and_leaves_mask():
     sess, sock, _, _ = make()
-    assert replies(say(sess, sock, "AT+BIA=x")) == ["ERROR"]
-    assert replies(say(sess, sock, "AT+BIA=1,1,1,1,1,1,1,1")) == ["ERROR"]
+    # lenient: never ERROR, bad tokens / extra fields ignored
+    assert replies(say(sess, sock, "AT+BIA=x")) == ["OK"]
+    assert replies(say(sess, sock, "AT+BIA=1,1,1,1,1,1,1,1")) == ["OK"]
+    assert replies(say(sess, sock, "AT+BIA=")) == ["OK"]
     assert sess.ind_enabled == [True] * 7
 
 
@@ -428,3 +430,14 @@ def test_devices_that_never_send_iphoneaccev_are_unaffected():
     # the spec path still works alongside
     assert replies(say(sess, sock, "AT+BIEV=2,40")) == ["OK"]
     assert sess.hf_battery == 40
+
+
+def test_bia_records_state_and_tolerates_extra_fields():
+    sess, sock, _, logs = make()
+    assert replies(say(sess, sock, "AT+BIA=1,0,1,1,1,1,0,1")) == ["OK"]
+    assert sess.ind_enabled == [True, False, True, True, True, True,
+                                False]
+    assert any("past 7" in l for l in logs)
+    # unrelated tokens in an otherwise valid list don't undo the rest
+    assert replies(say(sess, sock, "AT+BIA=1,z,0")) == ["OK"]
+    assert sess.ind_enabled[2] is False and sess.ind_enabled[1] is False

@@ -299,3 +299,50 @@ headsets off — one device connected)
   PipeWire-native graph watching later.
 - Hardware findings become `PERSONALITY_RULES` entries or branches in
   `GenericSession.handle`, per the brief — not redesigns.
+
+---
+
+# Addendum — fixes from the local hardware round (Oct 30)
+
+Step C was verified end to end on hardware; four follow-ups, all on
+`v2-generic-hfp`. `python3 -m pytest -q tests` → **123 passed**. The new
+code paths are stub-tested only; re-check the items below on the next
+local pass.
+
+1. **Stale `audio_reason` on the status line** (`hfp_registry.py`,
+   `hfp_audio.py`). Each recorded refusal now remembers which devices its
+   text names and why (`last_audio_peers`, `last_audio_kind`). The reason
+   is judged *at render time*, so no release/disconnect path can forget to
+   clear it: a "call audio busy" reason is current only while a named
+   device still holds the call (the registry asks the arbiter via
+   `call_holders`; the glasses count while `state ∈ starting|live`); a
+   failed-SCO reason is current only while a named device still has a link
+   up. While current it prints as `audio_reason="…"`; afterwards the same
+   text prints as **`last_refusal="…"`** (labelled history) and the
+   cumulative `audio_refusals=N` is untouched. A reason naming nobody
+   (e.g. provisioning failed) stays `audio_reason` until a later outcome.
+   The glasses' first status line is unchanged. *Re-check:* repeat the
+   HD 450BT scenario — after it disconnects, the glasses device line shows
+   `last_refusal=` and no `audio_reason`.
+2. **README — SCO known limitation** rewritten in its characterized form:
+   with a guest SLC up the *first* glasses call succeeded and subsequent
+   ones were refused (Errno 38/111) until the guest disconnected;
+   state-dependent, "observed on a Realtek adapter". The journal hint text
+   in code (`PLATFORM_HINT`) was left as is ("can make the controller
+   refuse") — still true, not narrowed to the new wording. Say if you want
+   it brought in line.
+3. **`AT+BIA` accepted** (`hfp_generic.py`). Step B already handled
+   well-formed BIA, but ERRORed on forms it did not anticipate (more than 7
+   fields, non-0/1 tokens). I could not tell from the report which form
+   the headset sent, so it is now deliberately lenient: the activation
+   state for the first seven indicators is recorded, extra fields and
+   non-0/1 tokens are logged and ignored, and the reply is always OK.
+   Tests that asserted ERROR for those inputs were changed to assert OK.
+   *Re-check:* if the journal shows the exact BIA line the headset sent
+   (the `past 7` / `not 0/1` log lines will appear), paste it.
+4. **README — lazy HFP on reconnect** documented under "Headset reconnect
+   notes": Corsair HS55 (and a Sennheiser pairing variant) may return
+   A2DP-only after a host-side reconnect; a power-cycle restores the
+   session; "observed on" wording; the daemon is a bystander.
+
+Nothing else was touched.

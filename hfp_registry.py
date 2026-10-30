@@ -121,6 +121,10 @@ class DeviceRecord:
         self.last_reason = ""
         self.audio_refusals = 0     # audio-open refusals (generic)
         self.last_audio_reason = ""
+        # What the reason names, so it can be judged stale later:
+        # kind "busy" = a call holder, "sco" = other connected devices.
+        self.last_audio_peers = ()
+        self.last_audio_kind = ""
         self.last_event = time.time()
 
     def link(self):
@@ -172,6 +176,9 @@ class DeviceRegistry:
         self.rules = rules
         self.lock = threading.Lock()
         self._records = {}      # address -> DeviceRecord
+        # Set of addresses currently holding the call (AudioManager
+        # wires this to the arbiter); used to judge "busy" reasons.
+        self.call_holders = lambda: set()
 
     # -- routing -----------------------------------------------------------
     def admit(self, info):
@@ -239,14 +246,18 @@ class DeviceRegistry:
         self.log(f"device {address}: session slot cleared")
         return True
 
-    def note_audio_refusal(self, address, reason):
-        """A served device asked for audio and was refused."""
+    def note_audio_refusal(self, address, reason, peers=(), kind=""):
+        """A served device asked for audio and was refused (or its
+        audio connect failed). `peers` are the addresses the reason
+        names; with `kind` they decide whether it is still current."""
         with self.lock:
             rec = self._records.get(address)
             if rec is None:
                 return
             rec.audio_refusals += 1
             rec.last_audio_reason = reason
+            rec.last_audio_peers = tuple(peers)
+            rec.last_audio_kind = kind
             rec.last_event = time.time()
 
     # -- introspection -----------------------------------------------------
@@ -257,6 +268,24 @@ class DeviceRegistry:
     def records(self):
         with self.lock:
             return list(self._records.values())
+
+    def audio_reason_current(self, rec):
+        """True while the last refusal's cause still holds: a "busy"
+        reason while a device it names still holds the call; an "sco"
+        reason while a device it names is still connected. A reason
+        that names nothing is always current."""
+        peers = rec.last_audio_peers
+        if not peers or not rec.last_audio_reason:
+            return bool(rec.last_audio_reason)
+        if rec.last_audio_kind == "busy":
+            holders = self.call_holders()
+            return any(p in holders for p in peers)
+        for p in peers:
+            other = self.get(p)
+            if other is not None and other.link() in ("up",
+                                                      "connecting"):
+                return True
+        return False
 
     def live_peers(self, address):
         """(address, name) of every OTHER device that currently holds
@@ -285,8 +314,12 @@ class DeviceRegistry:
             if detail and more is not None:
                 line += " " + more()
         if rec.audio_refusals:
-            line += (f" audio_refusals={rec.audio_refusals} "
-                     f"audio_reason=\"{rec.last_audio_reason}\"")
+            line += f" audio_refusals={rec.audio_refusals}"
+            # audio_reason only while its cause still holds; afterwards
+            # the same text is shown as history, labelled as such.
+            key = ("audio_reason" if self.audio_reason_current(rec)
+                   else "last_refusal")
+            line += f" {key}=\"{rec.last_audio_reason}\""
         return line
 
     def status_sections(self):

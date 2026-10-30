@@ -197,19 +197,36 @@ count as one. A second device asking for audio while a call is live is
 refused with a logged reason, and shows up as `audio_refusals` on its
 `status` line.
 
-### Known limitation: a second connected device can block glasses call audio
+### Known limitation: a connected second device can block later glasses calls
 
-On a single Bluetooth adapter, a second connected headset can block
-the glasses' call audio. Observed on a Realtek adapter: while any
-second device is connected (even idle), the controller refuses the
-glasses' synchronous connection (HCI status `0x1F`; the daemon logs
-`Errno 38`, then `111`); disconnecting the other device cures it
-immediately. Reproduced with two different vendors' headsets. Behavior
-may vary by adapter. **Disconnect or power off other headsets before a
-glasses call.** When a call-audio connection fails while another
-device is connected, the journal names this likely cause and the
-device's `status` line carries it as `audio_reason`. When the glasses
-are not in a call, other headsets get full service.
+Observed on a Realtek adapter (behavior may vary by adapter): with a
+second device connected (service-level link up, even idle), the
+**first** glasses call succeeds, but **subsequent** calls are refused
+by the controller — the synchronous connection fails with HCI status
+`0x1F`, which the daemon logs as `Errno 38`, then `111` — until the
+second device disconnects; after that, glasses calls work again. It
+is state-dependent, not a flat "never works", and was reproduced with
+two different vendors' headsets. Nothing in glasses-ag releases the
+other device's link for you: **disconnect or power off other headsets
+before glasses calls** (this matters most from the second call on).
+When a call-audio connection fails while another device is connected,
+the journal names this likely cause and the device's `status` line
+carries it as `audio_reason` for as long as the other device stays
+connected (and the cumulative `audio_refusals` count stays). When the
+glasses are not in a call, other headsets get full service.
+
+### Headset reconnect notes
+
+Observed on a Corsair HS55, and on one Sennheiser pairing variant:
+after a **host-side reconnect** (reconnecting from the computer's
+Bluetooth manager rather than from the headset) the headset may come
+back **A2DP-only** — it simply does not open its Hands-Free (HFP)
+connection, so no `… Mic` source appears and `glasses-mic status`
+shows no device line for it. **Power-cycling the headset restores the
+HFP session.** This is the headset being lazy about HFP, not the
+daemon: glasses-ag only answers the connection when the headset opens
+it, and it is a bystander here. Audio playback (A2DP) is unaffected
+either way.
 
 ## Device selection and configuration
 

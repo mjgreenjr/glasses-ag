@@ -290,19 +290,24 @@ class GenericSession:
         self._maybe_slc()
 
     def _on_bia(self, arg):
-        # '1,0,,1': per-CIND-index activation; empty field = unchanged.
+        """'1,0,,1': per-CIND-index activation; an empty field leaves
+        that indicator unchanged. Deliberately lenient (a real headset
+        got ERROR for a form we did not anticipate): fields beyond the
+        seven CIND indicators and tokens that are not 0/1 are logged
+        and ignored, and the command is always acknowledged."""
         parts = arg.split(",")
         if len(parts) > len(CIND_NAMES):
-            self.send(ERROR)
-            return
+            self.log(f"[{self.address}] AT+BIA with {len(parts)} fields; "
+                     f"ignoring those past {len(CIND_NAMES)}")
         new = list(self.ind_enabled)
-        for i, p in enumerate(parts):
+        for i, p in enumerate(parts[:len(CIND_NAMES)]):
             p = p.strip()
             if p == "":
                 continue
             if p not in ("0", "1"):
-                self.send(ERROR)
-                return
+                self.log(f"[{self.address}] AT+BIA field {i + 1} "
+                         f"{p!r} is not 0/1; ignored")
+                continue
             new[i] = p == "1"
         self.ind_enabled = new
         self.send(OK)

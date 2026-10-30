@@ -887,3 +887,85 @@ def test_stale_tunnel_processes_from_a_dead_daemon_are_reaped(tmp_path):
                                 kill=lambda p, s: killed.append((p, s)),
                                 log=lambda m: None)
     assert hit == [11] and killed == [(11, 15)]
+
+
+# -- status lifecycle: stale audio_reason ----------------------------------
+
+def _second_headset(e, addr="AA:BB:CC:00:00:02", name="Sennheiser HD 450BT"):
+    e.reg.admit(hr.DeviceInfo(addr, name=name, paired=True))
+    sock = FakeSock()
+    sess = hg.GenericSession(sock, "/dev/o", addr, name=name,
+                             registry=e.reg, log=e.logs.append)
+    e.reg.attach(addr, sess)
+    e.mgr.attach(sess)
+    say(sess, sock, f"AT+BRSF={HF_FEATURES}", "AT+BAC=1,2",
+        "AT+CMER=3,0,0,1", "AT+BIND=1,2", "AT+BIND?")
+    return sess, sock
+
+
+def _line(e, addr):
+    return [l for l in e.reg.status_sections() if f"device {addr} " in l][0]
+
+
+def test_busy_reason_clears_when_the_call_frees(tmp_path, monkeypatch):
+    ga = _install_fakes(monkeypatch)
+    e = make_env(tmp_path)
+    core, _ = _glasses_core(ga, e)
+    slc(e)
+    open_call(e)                                   # Corsair holds the call
+    assert core.cmd_start().startswith("err: call audio busy")
+    line = _line(e, GLASSES_ADDR)
+    assert "audio_refusals=1" in line
+    assert 'audio_reason="call audio busy: Corsair HS55' in line
+    e.audio.stop()                                 # arbiter frees
+    line = _line(e, GLASSES_ADDR)
+    assert "audio_refusals=1" in line              # counter stays
+    assert "audio_reason" not in line              # no longer current
+    assert 'last_refusal="call audio busy: Corsair HS55' in line
+
+
+def test_busy_reason_clears_when_the_named_device_disconnects(
+        tmp_path, monkeypatch):
+    ga = _install_fakes(monkeypatch)
+    e = make_env(tmp_path)
+    core, _ = _glasses_core(ga, e)
+    slc(e)
+    open_call(e)
+    core.cmd_start()
+    assert "audio_reason=" in _line(e, GLASSES_ADDR)
+    e.sess.run()                                   # Corsair disconnects
+    assert e.reg.get(ADDR).link() == "down"
+    line = _line(e, GLASSES_ADDR)
+    assert "audio_reason" not in line and "last_refusal=" in line
+
+
+def test_busy_reason_naming_the_glasses_clears_when_their_call_ends(
+        tmp_path, monkeypatch):
+    ga = _install_fakes(monkeypatch)
+    e = make_env(tmp_path)
+    core, _ = _glasses_core(ga, e, state="live")
+    slc(e)
+    say(e.sess, e.sock, "AT+BCC")
+    assert "audio_reason=" in _line(e, ADDR)
+    core.state = "ready"
+    assert "audio_reason" not in _line(e, ADDR)
+    assert "last_refusal=" in _line(e, ADDR)
+
+
+def test_sco_reason_clears_when_the_other_device_goes_away(tmp_path):
+    e = make_env(tmp_path, connect_fail=99)
+    osess, _ = _second_headset(e)
+    slc(e)
+    open_call(e)                                   # fails: peer connected
+    assert "audio_reason=" in _line(e, ADDR)
+    osess.alive = False                            # Sennheiser link down
+    line = _line(e, ADDR)
+    assert "audio_reason" not in line and "last_refusal=" in line
+    assert "audio_refusals=1" in line
+
+
+def test_reason_naming_nobody_stays_current(tmp_path):
+    e = make_env(tmp_path, pw="missing")
+    slc(e)
+    say(e.sess, e.sock, "AT+BCC")
+    assert "audio_reason=\"audio provisioning failed" in _line(e, ADDR)

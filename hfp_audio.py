@@ -254,7 +254,17 @@ class CallArbiter:
         self.log = log
         self.glasses_busy = lambda: False
         self.glasses_label = "the glasses"
+        self.glasses_address = lambda: None
+        self.last_peers = ()        # who the latest busy refusal named
         self._generic = {}          # address -> display name
+
+    def holders(self):
+        """Addresses currently holding the call (glasses included)."""
+        with self.lock:
+            out = set(self._generic)
+            if self.glasses_busy() and self.glasses_address():
+                out.add(self.glasses_address())
+            return out
 
     def generic_holder(self):
         """'Name (addr)' of a generic device holding the call, or None.
@@ -269,9 +279,11 @@ class CallArbiter:
             if address in self._generic:
                 return True, ""
             if self.glasses_busy():
+                self.last_peers = (self.glasses_address(),)
                 return False, (f"call audio busy: {self.glasses_label} "
                                "hold the call (one call at a time)")
             for addr, other in self._generic.items():
+                self.last_peers = (addr,)
                 return False, (f"call audio busy: {other} ({addr}) holds "
                                "the call (one call at a time)")
             self._generic[address] = name
@@ -286,13 +298,16 @@ class CallArbiter:
         before it sets state=starting. Returns a reason or None."""
         holder = self.generic_holder()
         if holder:
+            self.last_peers = tuple(self._generic)
             return (f"call audio busy: {holder} holds the call "
                     "(one call at a time)")
         return None
 
     def note_refusal(self, address, reason):
+        """Record a "call audio busy" refusal naming the holder(s)."""
         if self.registry is not None and address:
-            self.registry.note_audio_refusal(address, reason)
+            self.registry.note_audio_refusal(
+                address, reason, peers=self.last_peers, kind="busy")
 
 
 # -- platform-constraint diagnostic -------------------------------------------
@@ -318,7 +333,9 @@ def explain_sco_failure(registry, address, exc, log=_default_log):
             "is connected, so this is not the multi-device constraint")
         reason = f"SCO connect failed ({exc})"
     if registry is not None and address:
-        registry.note_audio_refusal(address, reason)
+        registry.note_audio_refusal(address, reason,
+                                    peers=[a for a, _ in peers],
+                                    kind="sco")
     return reason
 
 
@@ -722,9 +739,9 @@ class GenericAudio:
         self.deps.spawn(self.parker.reconcile, name="a2dp-reconcile")
 
     # -- refusal ---------------------------------------------------------
-    def _refuse(self, source, reason):
+    def _refuse(self, source, reason, busy=False):
         self.log(f"{self.tag} audio-open refused ({source}): {reason}")
-        self.mgr.note_refusal(self.address, reason)
+        self.mgr.note_refusal(self.address, reason, busy=busy)
         return False
 
     # -- request (the audio_opener seam) ---------------------------------
@@ -755,7 +772,7 @@ class GenericAudio:
             ok, why = self.mgr.arbiter.claim_generic(self.address,
                                                      self.name)
             if not ok:
-                return self._refuse(source, why)
+                return self._refuse(source, why, busy=True)
             self._gen += 1
             self.state = "offering"
             self.trigger = source
@@ -1073,6 +1090,8 @@ class AudioManager:
         self.registry = registry
         self.log = deps.log
         self.arbiter = CallArbiter(registry, deps.log)
+        if registry is not None:
+            registry.call_holders = self.arbiter.holders
         self.lock = threading.RLock()
         self._by_addr = {}
         self._watcher = False
@@ -1083,6 +1102,8 @@ class AudioManager:
         self.arbiter.glasses_busy = lambda: core.state in (
             "starting", "live")
         core.arbiter = self.arbiter
+        self.arbiter.glasses_address = lambda: getattr(
+            core.session, "address", None)
         core.sco_diagnoser = lambda addr, exc: explain_sco_failure(
             self.registry, addr, exc, self.log)
 
@@ -1105,10 +1126,13 @@ class AudioManager:
         with self.lock:
             self._last_reason[address] = reason
 
-    def note_refusal(self, address, reason):
+    def note_refusal(self, address, reason, busy=False):
         self.remember_reason(address, reason)
         if self.registry is not None:
-            self.registry.note_audio_refusal(address, reason)
+            peers = self.arbiter.last_peers if busy else ()
+            self.registry.note_audio_refusal(
+                address, reason, peers=peers,
+                kind="busy" if busy else "")
 
     def last_reason(self, address):
         with self.lock:
